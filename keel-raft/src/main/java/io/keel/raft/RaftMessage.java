@@ -129,4 +129,28 @@ public sealed interface RaftMessage {
             return new HeartbeatReply(from, to, term, readSeq);
         }
     }
+
+    /**
+     * A follower asking the leader for an index it can safely read at.
+     *
+     * <p>Forwarding the request rather than the read itself is the point: the follower then serves the
+     * read from its own state machine, so reads scale with the cluster instead of piling onto the
+     * leader, and they are still linearizable because the index came from a leader that confirmed
+     * itself.
+     */
+    record ReadIndexRequest(long from, long to, long term, long requestId) implements RaftMessage {
+        @Override
+        public RaftMessage withTo(long to) {
+            return new ReadIndexRequest(from, to, term, requestId);
+        }
+    }
+
+    /** The leader's answer to {@link ReadIndexRequest}. */
+    record ReadIndexReply(long from, long to, long term, long requestId, long readIndex)
+            implements RaftMessage {
+        @Override
+        public RaftMessage withTo(long to) {
+            return new ReadIndexReply(from, to, term, requestId, readIndex);
+        }
+    }
 }

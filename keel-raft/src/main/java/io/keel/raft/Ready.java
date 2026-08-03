@@ -31,17 +31,21 @@ import java.util.List;
  *     above the first index here is being replaced
  * @param committedEntries entries to hand to the state machine, in index order
  * @param messages messages to put on the wire, valid only after the writes above are durable
+ * @param readStates reads that have been given a safe index; each may be answered once the state
+ *     machine has applied at least that index
  */
 public record Ready(
         HardState hardState,
         List<Entry> entriesToPersist,
         List<Entry> committedEntries,
-        List<RaftMessage> messages) {
+        List<RaftMessage> messages,
+        List<ReadState> readStates) {
 
     public Ready {
         entriesToPersist = List.copyOf(entriesToPersist);
         committedEntries = List.copyOf(committedEntries);
         messages = List.copyOf(messages);
+        readStates = List.copyOf(readStates);
     }
 
     /** True when the core has nothing for the driver to do. */
@@ -49,7 +53,8 @@ public record Ready(
         return hardState == null
                 && entriesToPersist.isEmpty()
                 && committedEntries.isEmpty()
-                && messages.isEmpty();
+                && messages.isEmpty()
+                && readStates.isEmpty();
     }
 
     public boolean hasHardState() {
@@ -69,6 +74,8 @@ public record Ready(
                 + committedEntries.size()
                 + " send="
                 + messages.size()
+                + " reads="
+                + readStates.size()
                 + "]";
     }
 }

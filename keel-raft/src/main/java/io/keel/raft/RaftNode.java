@@ -2,8 +2,10 @@ package io.keel.raft;
 
 import io.keel.proto.log.Entry;
 import io.keel.proto.log.HardState;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -60,6 +62,35 @@ public final class RaftNode {
 
     /** Set when term, vote, or commit index changed and has not been persisted yet. */
     private boolean hardStateDirty;
+
+    /**
+     * Reads waiting for a heartbeat round to confirm this node is still the leader. Each carries the
+     * commit index as it stood when the round was sent, which is what makes it safe to read at.
+     */
+    private final Deque<PendingRead> pendingReads = new ArrayDeque<>();
+
+    /**
+     * Reads that arrived before this leader had committed anything in its own term, so there is no
+     * safe index to give them yet. Released once its no-op commits.
+     */
+    private final List<PendingRead> deferredReads = new ArrayList<>();
+
+    /** Acknowledgements per heartbeat round, including this node's own. */
+    private final Map<Long, Integer> readRoundAcks = new HashMap<>();
+
+    private long readRound;
+
+    private final List<ReadState> readStates = new ArrayList<>();
+
+    /**
+     * A read waiting to be answered.
+     *
+     * @param origin the node that wants the answer; this node when the client asked it directly
+     * @param requestId the origin's identifier for the request
+     * @param readIndex commit index recorded when the round was started
+     * @param round heartbeat round that must be confirmed before this read is safe
+     */
+    private record PendingRead(long origin, long requestId, long readIndex, long round) {}
 
     /**
      * Restores a node from persisted state.
@@ -175,6 +206,14 @@ public final class RaftNode {
                     handleHeartbeatReply(h);
                 }
             }
+            case RaftMessage.ReadIndexRequest r -> {
+                if (role == Role.LEADER) {
+                    beginRead(r.from(), r.requestId());
+                }
+                // A follower that is asked for a read index simply drops it. The requester is waiting
+                // on a timeout and will retry once it learns who the leader is.
+            }
+            case RaftMessage.ReadIndexReply r -> readStates.add(new ReadState(r.requestId(), r.readIndex()));
         }
     }
 
@@ -198,6 +237,44 @@ public final class RaftNode {
         log.append(List.of(Entries.normal(index, term, data)));
         broadcastAppend();
         return index;
+    }
+
+    /**
+     * Asks for an index that can be read at without violating linearizability.
+     *
+     * <p>This is ReadIndex, paper section 6.4. Reading a leader's local state without it is not
+     * linearizable: a leader that has been partitioned away still believes it is the leader for up to
+     * one election timeout, and will happily serve a value a newer leader has already replaced.
+     *
+     * <p>Two conditions have to hold, and skipping either is the usual bug:
+     *
+     * <ol>
+     *   <li>The leader must have committed an entry in its current term, so it knows the full
+     *       committed prefix. That is what the no-op appended on election is for. Until then the read
+     *       is held, not answered.
+     *   <li>The leader must confirm it is <em>still</em> the leader by completing a heartbeat round
+     *       with a quorum after recording the index. Recording the commit index proves nothing on its
+     *       own; the quorum round is what rules out a leader that has already been deposed.
+     * </ol>
+     *
+     * <p>A follower forwards the request and serves the read itself once its own state machine reaches
+     * the index it gets back. Nothing is appended to the log either way.
+     *
+     * <p>The answer arrives as a {@link ReadState} in a later {@link Ready}. Requests are dropped
+     * without notice if leadership changes while they are in flight, so callers need a timeout.
+     *
+     * @param requestId caller's identifier, echoed back in the {@link ReadState}
+     * @throws NotLeaderException if no leader is known, so there is nobody to ask
+     */
+    public void requestRead(long requestId) {
+        if (role == Role.LEADER) {
+            beginRead(cfg.nodeId(), requestId);
+            return;
+        }
+        if (leaderId == NO_NODE) {
+            throw new NotLeaderException(NO_NODE);
+        }
+        send(new RaftMessage.ReadIndexRequest(cfg.nodeId(), leaderId, term, requestId));
     }
 
     /**
@@ -231,8 +308,10 @@ public final class RaftNode {
                         hardStateDirty ? currentHardState() : null,
                         log.unstableEntries(),
                         log.nextCommittedEntries(),
-                        List.copyOf(outbound));
+                        List.copyOf(outbound),
+                        List.copyOf(readStates));
         outbound.clear();
+        readStates.clear();
         return rd;
     }
 
@@ -381,6 +460,7 @@ public final class RaftNode {
         electionTimeout = nextElectionTimeout();
         peers.clear();
         ballots.clear();
+        abandonReads();
     }
 
     private void becomePreCandidate() {
@@ -413,6 +493,7 @@ public final class RaftNode {
         electionElapsed = 0;
         heartbeatElapsed = 0;
         ballots.clear();
+        abandonReads();
 
         peers.clear();
         long nextIndex = log.lastIndex() + 1;
@@ -650,6 +731,7 @@ public final class RaftNode {
             return;
         }
         p.recentActive = true;
+        confirmReadRound(reply.readSeq());
         // A heartbeat response proves the follower is reachable again, so let the flow resume.
         // Without this, a probe whose response was lost, or one sent to a node that then crashed,
         // leaves the follower paused forever: nothing else ever clears the flag, and the follower
@@ -742,7 +824,87 @@ public final class RaftNode {
             hardStateDirty = true;
             // Let followers learn the new commit index now rather than on the next heartbeat.
             broadcastAppend();
+            releaseDeferredReads();
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Linearizable reads
+    // ---------------------------------------------------------------------------------------------
+
+    /** True once this leader has committed an entry of its own term. */
+    private boolean committedInCurrentTerm() {
+        return log.committed() > 0 && log.term(log.committed()) == term;
+    }
+
+    private void beginRead(long origin, long requestId) {
+        if (!committedInCurrentTerm()) {
+            // No safe index exists yet: this leader does not know its own committed prefix until one
+            // of its entries commits. Hold the request rather than guessing.
+            deferredReads.add(new PendingRead(origin, requestId, 0, 0));
+            return;
+        }
+        if (peers.isEmpty()) {
+            // A single-node cluster is its own quorum, so leadership is already confirmed.
+            deliverRead(new PendingRead(origin, requestId, log.committed(), 0));
+            return;
+        }
+        long round = ++readRound;
+        pendingReads.add(new PendingRead(origin, requestId, log.committed(), round));
+        readRoundAcks.put(round, 1);
+        broadcastHeartbeat(round);
+    }
+
+    /** Releases reads that were waiting for this leader to commit something in its term. */
+    private void releaseDeferredReads() {
+        if (deferredReads.isEmpty() || !committedInCurrentTerm()) {
+            return;
+        }
+        List<PendingRead> waiting = List.copyOf(deferredReads);
+        deferredReads.clear();
+        for (PendingRead read : waiting) {
+            beginRead(read.origin(), read.requestId());
+        }
+    }
+
+    /**
+     * Counts a heartbeat response toward its round and answers whatever it confirms.
+     *
+     * <p>Rounds are confirmed in order: a response for round R also confirms every earlier round,
+     * because leadership at R implies leadership at every point before it.
+     */
+    private void confirmReadRound(long round) {
+        if (round == 0 || !readRoundAcks.containsKey(round)) {
+            // Round 0 is a plain heartbeat, and an unknown round is a response from a round this node
+            // has already resolved or never started. Counting either would be counting a response
+            // from the wrong round, which is exactly what the token exists to prevent.
+            return;
+        }
+        int acks = readRoundAcks.merge(round, 1, Integer::sum);
+        if (acks < quorum()) {
+            return;
+        }
+        readRoundAcks.keySet().removeIf(r -> r <= round);
+        while (!pendingReads.isEmpty() && pendingReads.peek().round() <= round) {
+            deliverRead(pendingReads.poll());
+        }
+    }
+
+    private void deliverRead(PendingRead read) {
+        if (read.origin() == cfg.nodeId()) {
+            readStates.add(new ReadState(read.requestId(), read.readIndex()));
+        } else {
+            send(
+                    new RaftMessage.ReadIndexReply(
+                            cfg.nodeId(), read.origin(), term, read.requestId(), read.readIndex()));
+        }
+    }
+
+    /** Abandons reads in flight. Whoever was waiting sees a timeout and retries elsewhere. */
+    private void abandonReads() {
+        pendingReads.clear();
+        deferredReads.clear();
+        readRoundAcks.clear();
     }
 
     // ---------------------------------------------------------------------------------------------
