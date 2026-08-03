@@ -366,6 +366,22 @@ public final class Sim {
         return node.applied.isEmpty() ? 0 : node.applied.get(node.applied.size() - 1).getIndex();
     }
 
+    /**
+     * The command a node applied at {@code index}, if it applied that index at all.
+     *
+     * <p>A client that proposed at an index and then finds a different command there has learned that
+     * its write was overwritten before it committed, which is the case where the outcome is genuinely
+     * unknown rather than merely slow.
+     */
+    public java.util.Optional<ByteString> appliedDataAt(long id, long index) {
+        for (Entry entry : node(id).applied) {
+            if (entry.getIndex() == index) {
+                return java.util.Optional.of(entry.getData());
+            }
+        }
+        return java.util.Optional.empty();
+    }
+
     public boolean isDown(long id) {
         return node(id).down;
     }
