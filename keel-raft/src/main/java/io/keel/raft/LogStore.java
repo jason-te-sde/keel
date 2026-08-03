@@ -2,6 +2,7 @@ package io.keel.raft;
 
 import io.keel.proto.log.Entry;
 import io.keel.proto.log.HardState;
+import io.keel.proto.log.SnapshotMetadata;
 import java.util.List;
 
 /**
@@ -43,6 +44,26 @@ public interface LogStore extends RaftStorage, AutoCloseable {
 
     /** Makes every preceding write durable. */
     void sync();
+
+    /**
+     * Discards entries at or below {@code meta.getLastIndex()}, keeping everything above.
+     *
+     * <p>Called after the state machine has written a snapshot covering that index. The snapshot must
+     * be durable first: this is the point of no return, and losing both the snapshot and the entries
+     * it replaced loses committed data.
+     *
+     * @throws IllegalArgumentException if the index is above the last index, or below the current
+     *     snapshot boundary
+     */
+    void compact(SnapshotMetadata meta);
+
+    /**
+     * Replaces the entire log with a snapshot boundary, for a follower catching up from one.
+     *
+     * <p>Unlike {@link #compact}, nothing is kept: the receiving node's log may have diverged from the
+     * leader's, so entries above the snapshot are not necessarily valid and are discarded too.
+     */
+    void installSnapshot(SnapshotMetadata meta);
 
     /**
      * Releases any resources held by the store. Implementations backed by memory need do nothing.

@@ -13,6 +13,9 @@ import io.keel.raft.RaftNode;
 import io.keel.raft.ReadState;
 import io.keel.raft.Ready;
 import io.keel.raft.Role;
+import io.keel.proto.log.SnapshotMetadata;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -53,6 +56,13 @@ public final class Sim {
         RaftNode raft;
         boolean down;
 
+        /** The newest snapshot this node has taken, and its payload. */
+        SnapshotMetadata snapshotMeta = SnapshotMetadata.getDefaultInstance();
+        byte[] snapshotPayload = new byte[0];
+
+        /** Term of the highest entry applied, needed to label a snapshot. */
+        long lastAppliedTerm;
+
         Node(long id) {
             this.id = id;
         }
@@ -69,6 +79,23 @@ public final class Sim {
     private long proposals;
     private long crashes;
     private long partitions;
+    private long snapshotsTaken;
+    private long snapshotsInstalled;
+
+    /**
+     * Snapshot payloads in flight, by recipient.
+     *
+     * <p>Recorded when the leader emits InstallSnapshot and consumed when the follower installs it.
+     * The metadata message travels through the network and can be delayed, dropped, or duplicated like
+     * anything else; only the bulk payload takes this shortcut, which is the same split the real
+     * transport makes.
+     *
+     * <p>Keyed by recipient <em>and</em> boundary index, not by recipient alone. Two leaders can have a
+     * snapshot in flight to the same node at different boundaries, and pairing a payload with the wrong
+     * metadata gives a node a state machine that disagrees with its own log. That was a real bug here,
+     * and it presented as a compaction request past the end of the log several hundred ticks later.
+     */
+    private final Map<String, byte[]> snapshotsInFlight = new LinkedHashMap<>();
 
     public static Sim of(SimConfig config) {
         return new Sim(config);
@@ -169,6 +196,12 @@ public final class Sim {
         if (ready.isEmpty()) {
             return;
         }
+        // The snapshot goes first. Entries in the same batch are the ones that follow its boundary,
+        // and appending them into a log that still starts lower down would leave a gap. This ordering
+        // is not obvious from the Ready contract, which is why it is spelled out there too.
+        if (ready.hasSnapshotToInstall()) {
+            installSnapshot(node, ready.snapshotToInstall());
+        }
         if (ready.hasHardState()) {
             node.store.saveHardState(ready.hardState());
         }
@@ -178,17 +211,80 @@ public final class Sim {
         node.store.sync();
 
         for (RaftMessage message : ready.messages()) {
+            if (message instanceof RaftMessage.InstallSnapshot snapshot) {
+                // Hand the payload over out of band, as the real transport does with its streaming RPC.
+                snapshotsInFlight.put(
+                        payloadKey(snapshot.to(), snapshot.meta().getLastIndex()), node.snapshotPayload);
+            }
             network.send(tick, message, random, config);
         }
         for (Entry entry : ready.committedEntries()) {
             node.applied.add(entry);
+            node.lastAppliedTerm = entry.getTerm();
             if (entry.getType() == EntryType.ENTRY_TYPE_NORMAL) {
                 node.stateMachine.apply(entry.getIndex(), entry.getData());
             }
         }
         node.reads.addAll(ready.readStates());
         node.raft.advance(ready);
+        maybeSnapshot(node);
         mixTrace(node.id, ready.entriesToPersist().size(), ready.committedEntries().size());
+    }
+
+    /**
+     * Takes a snapshot and compacts the log once it has grown past the threshold.
+     *
+     * <p>Ordering is the whole point: the state machine snapshot is serialized first and the log is
+     * compacted second. Compacting first would leave a window where the entries are gone and nothing
+     * else holds their effects.
+     */
+    private void maybeSnapshot(Node node) {
+        int threshold = config.snapshotThresholdEntries();
+        if (threshold == 0) {
+            return;
+        }
+        long applied = node.stateMachine.appliedIndex();
+        if (applied == 0 || applied - node.snapshotMeta.getLastIndex() < threshold) {
+            return;
+        }
+        // Only snapshot what the state machine has actually applied, and only at an index whose term
+        // is known.
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        node.stateMachine.snapshot(out);
+        SnapshotMetadata meta =
+                SnapshotMetadata.newBuilder()
+                        .setLastIndex(applied)
+                        .setLastTerm(node.lastAppliedTerm)
+                        .setSizeBytes(out.size())
+                        .build();
+        node.snapshotPayload = out.toByteArray();
+        node.snapshotMeta = meta;
+        node.store.compact(meta);
+        snapshotsTaken++;
+        mixTrace(node.id, -3, applied);
+    }
+
+    private static String payloadKey(long to, long lastIndex) {
+        return to + ":" + lastIndex;
+    }
+
+    private void installSnapshot(Node node, SnapshotMetadata meta) {
+        byte[] payload = snapshotsInFlight.remove(payloadKey(node.id, meta.getLastIndex()));
+        if (payload == null) {
+            throw new IllegalStateException(
+                    "node " + node.id + " accepted a snapshot at " + meta.getLastIndex()
+                            + " with no payload in flight");
+        }
+        node.stateMachine.restore(new ByteArrayInputStream(payload));
+        node.store.installSnapshot(meta);
+        node.snapshotMeta = meta;
+        node.snapshotPayload = payload;
+        node.lastAppliedTerm = meta.getLastTerm();
+        // The pre-snapshot applied list is not a record of this node's state any more: the snapshot
+        // replaced it wholesale. Invariants compare by log index, so the shorter list is fine.
+        node.applied.clear();
+        snapshotsInstalled++;
+        mixTrace(node.id, -4, meta.getLastIndex());
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -248,6 +344,12 @@ public final class Sim {
         node.stateMachine = new MemoryStateMachine();
         node.applied.clear();
         node.reads.clear();
+        // The snapshot file survives a crash, so recovery restores from it and replays the log after
+        // it. Without this the node would replay from index 1 into a log whose prefix is gone.
+        if (node.snapshotMeta.getLastIndex() > 0) {
+            node.stateMachine.restore(new ByteArrayInputStream(node.snapshotPayload));
+            node.lastAppliedTerm = node.snapshotMeta.getLastTerm();
+        }
         network.forget(id);
         crashes++;
         mixTrace(id, -1, 0);
@@ -382,6 +484,11 @@ public final class Sim {
         return java.util.Optional.empty();
     }
 
+    /** The snapshot boundary a node has compacted to. */
+    public long snapshotIndex(long id) {
+        return node(id).snapshotMeta.getLastIndex();
+    }
+
     public boolean isDown(long id) {
         return node(id).down;
     }
@@ -454,7 +561,9 @@ public final class Sim {
                 network.delivered(),
                 network.dropped(),
                 network.duplicated(),
-                invariants.checkCount());
+                invariants.checkCount(),
+                snapshotsTaken,
+                snapshotsInstalled);
     }
 
     /** Aggregate counters from a run. */
@@ -467,7 +576,9 @@ public final class Sim {
             long messagesDelivered,
             long messagesDropped,
             long messagesDuplicated,
-            long invariantChecks) {}
+            long invariantChecks,
+            long snapshotsTaken,
+            long snapshotsInstalled) {}
 
     public String describe() {
         StringBuilder sb = new StringBuilder("sim at tick " + tick + " (seed " + config.seed() + ")\n");

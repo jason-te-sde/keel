@@ -17,7 +17,13 @@ final class Progress {
      */
     enum State {
         PROBE,
-        REPLICATE
+        REPLICATE,
+        /**
+         * A snapshot is being sent. The follower needs entries this leader no longer has, so nothing
+         * is sent to it until the snapshot lands: further appends would only be rejected, and the
+         * rejections would rewind progress that the snapshot is about to fix.
+         */
+        SNAPSHOT
     }
 
     long match;
@@ -26,6 +32,9 @@ final class Progress {
 
     /** True when a probe is outstanding, so PROBE sends one message and then waits. */
     boolean probeSent;
+
+    /** Index of the snapshot in flight, or 0 when none is. */
+    long pendingSnapshotIndex;
 
     /**
      * Set when anything is received from this follower, cleared each time check-quorum samples it.
@@ -57,12 +66,32 @@ final class Progress {
     void becomeProbe(long nextIndex) {
         state = State.PROBE;
         probeSent = false;
+        pendingSnapshotIndex = 0;
         next = Math.max(nextIndex, match + 1);
+    }
+
+    void becomeSnapshot(long snapshotIndex) {
+        state = State.SNAPSHOT;
+        probeSent = false;
+        pendingSnapshotIndex = snapshotIndex;
+    }
+
+    /**
+     * Called when a snapshot in flight is known to have landed, or to have failed.
+     *
+     * <p>Either way the follower leaves SNAPSHOT state. On success its match index is at least the
+     * snapshot boundary; on failure the leader retries, which will discover a snapshot is still needed.
+     */
+    void snapshotFinished(boolean landed) {
+        if (landed) {
+            match = Math.max(match, pendingSnapshotIndex);
+        }
+        becomeProbe(match + 1);
     }
 
     /** True when this follower should not be sent another message right now. */
     boolean paused() {
-        return state == State.PROBE && probeSent;
+        return state == State.SNAPSHOT || (state == State.PROBE && probeSent);
     }
 
     @Override

@@ -3,6 +3,7 @@ package io.keel.storage;
 import io.keel.proto.log.Entry;
 import io.keel.proto.log.HardState;
 import io.keel.proto.log.Record;
+import io.keel.proto.log.SnapshotMetadata;
 import io.keel.raft.LogStore;
 import io.keel.raft.RaftStorage.CompactedException;
 import java.io.IOException;
@@ -52,6 +53,7 @@ public final class SegmentedLog implements LogStore {
 
     private long firstIndex = 1;
     private long nextSequence = 1;
+    private SnapshotMetadata snapshot = SnapshotMetadata.getDefaultInstance();
     private HardState state = HardState.getDefaultInstance();
     private boolean dirty;
     private long discardedBytes;
@@ -157,6 +159,21 @@ public final class SegmentedLog implements LogStore {
             state = record.getState();
             return;
         }
+        if (record.hasSnapshot()) {
+            // Entries at or below the boundary are covered by a state machine snapshot, so the ones
+            // already replayed are void. Entries *above* it are not: compaction keeps the tail, and
+            // those records were written before the marker. Dropping them here would silently lose
+            // committed entries on every restart after a compaction.
+            SnapshotMetadata meta = record.getSnapshot();
+            long newFirst = meta.getLastIndex() + 1;
+            if (newFirst > firstIndex) {
+                int drop = (int) Math.min(newFirst - firstIndex, locations.size());
+                locations.subList(0, drop).clear();
+                firstIndex = newFirst;
+            }
+            snapshot = meta;
+            return;
+        }
         if (!record.hasEntry()) {
             // An unknown record kind from a future version. Refusing is safer than ignoring: this
             // build cannot know whether skipping it changes the meaning of the log.
@@ -207,9 +224,16 @@ public final class SegmentedLog implements LogStore {
     }
 
     @Override
+    public SnapshotMetadata snapshotMetadata() {
+        return snapshot;
+    }
+
+    @Override
     public long term(long index) {
         if (index == firstIndex - 1) {
-            return 0;
+            // The snapshot boundary. A zeroed snapshot reports term 0, which is right for a log that
+            // has never been compacted.
+            return snapshot.getLastTerm();
         }
         if (index < firstIndex) {
             throw new CompactedException(index, firstIndex);
@@ -304,6 +328,92 @@ public final class SegmentedLog implements LogStore {
         segmentFor(framed.length).append(framed);
         this.state = newState;
         dirty = true;
+    }
+
+    @Override
+    public void compact(SnapshotMetadata meta) {
+        if (meta.getLastIndex() < firstIndex - 1) {
+            throw new IllegalArgumentException(
+                    "snapshot at "
+                            + meta.getLastIndex()
+                            + " is behind the current boundary "
+                            + (firstIndex - 1));
+        }
+        if (meta.getLastIndex() > lastIndex()) {
+            throw new IllegalArgumentException(
+                    "cannot compact to " + meta.getLastIndex() + " past the last index " + lastIndex());
+        }
+        // The marker is a normal appended record, so a crash either has it or does not; there is no
+        // state where the log is compacted but does not say so. It is synced before any segment is
+        // deleted, because deleting first would leave a log whose entries are gone and whose
+        // boundary still claims they should be there.
+        byte[] framed = RecordCodec.encode(Record.newBuilder().setSnapshot(meta).build());
+        segmentFor(framed.length).append(framed);
+        dirty = true;
+        sync();
+
+        int drop = (int) (meta.getLastIndex() - firstIndex + 1);
+        locations.subList(0, drop).clear();
+        firstIndex = meta.getLastIndex() + 1;
+        snapshot = meta;
+        deleteUnreferencedSegments();
+    }
+
+    @Override
+    public void installSnapshot(SnapshotMetadata meta) {
+        // A follower catching up from a snapshot discards its whole log, not just the prefix: its
+        // entries above the boundary may have come from a leader that lost, so they are not known to
+        // be valid either.
+        locations.clear();
+        for (Segment segment : segments) {
+            segment.delete();
+        }
+        segments.clear();
+        firstIndex = meta.getLastIndex() + 1;
+        snapshot = meta;
+        try {
+            segments.add(Segment.create(options.directory(), nextSequence++, firstIndex));
+            syncDirectory();
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to start a segment after installing a snapshot", e);
+        }
+        byte[] framed = RecordCodec.encode(Record.newBuilder().setSnapshot(meta).build());
+        active().append(framed);
+        dirty = true;
+        sync();
+    }
+
+    /**
+     * Deletes segments no live entry points into.
+     *
+     * <p>The rule is emptiness rather than base index, because a superseding append can put a low
+     * index into a segment created later: a segment's name is a hint, and the location index is the
+     * only authority on what is still reachable.
+     */
+    private void deleteUnreferencedSegments() {
+        java.util.Set<Segment> referenced =
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        for (Loc loc : locations) {
+            referenced.add(loc.segment());
+        }
+        Segment active = active();
+        java.util.Iterator<Segment> it = segments.iterator();
+        int removed = 0;
+        while (it.hasNext()) {
+            Segment segment = it.next();
+            if (segment != active && !referenced.contains(segment)) {
+                segment.delete();
+                it.remove();
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            LOG.info(
+                    "compacted to index {}, deleted {} segment{}",
+                    snapshot.getLastIndex(),
+                    removed,
+                    removed == 1 ? "" : "s");
+        }
     }
 
     @Override

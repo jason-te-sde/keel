@@ -143,6 +143,50 @@ class SimTest {
     }
 
     @Test
+    @DisplayName("a follower that missed a compacted range catches up from a snapshot")
+    void followerCatchesUpFromASnapshot() {
+        // The path that does not exist without compaction: the follower needs entries the leader has
+        // already thrown away, so entries alone cannot repair it.
+        Sim sim = Sim.of(SimConfig.quiet(3, 4242));
+        assertTrue(sim.runUntilLeader(200));
+        long leader = sim.leader().orElseThrow();
+        long victim = sim.ids().stream().filter(id -> id != leader).findFirst().orElseThrow();
+
+        sim.crash(victim);
+        for (int i = 0; i < 80; i++) {
+            sim.propose(Commands.put(Commands.NO_SESSION, "k" + i, "v" + i));
+            sim.run(2);
+        }
+        assertTrue(
+                sim.snapshotIndex(leader) > 0,
+                "the leader should have compacted by now: " + sim.stats());
+
+        sim.restart(victim);
+        assertTrue(
+                sim.runUntil(() -> sim.snapshotIndex(victim) >= sim.snapshotIndex(leader), 600),
+                "the follower never received a snapshot\n" + sim.describe());
+        assertTrue(
+                sim.runUntil(
+                        () -> sim.stateMachine(victim).size() == sim.stateMachine(leader).size(), 600),
+                "the follower never caught up\n" + sim.describe());
+        assertTrue(sim.stats().snapshotsInstalled() > 0, "expected an install: " + sim.stats());
+    }
+
+    @Test
+    @DisplayName("compaction happens during a chaotic run and safety still holds")
+    void compactionUnderChaos() {
+        Sim sim = Sim.of(SimConfig.chaotic(5, 909));
+
+        workload(sim, 1500);
+
+        Sim.SimStats stats = sim.stats();
+        assertTrue(stats.snapshotsTaken() > 0, "no snapshot was taken: " + stats);
+        assertTrue(
+                sim.ids().stream().anyMatch(id -> sim.snapshotIndex(id) > 0),
+                "no node compacted its log: " + stats);
+    }
+
+    @Test
     @DisplayName("a linearizable read is only ever answered by a confirmed leader")
     void readsUnderPartition() {
         Sim sim = Sim.of(SimConfig.quiet(3, 5));

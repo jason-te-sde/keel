@@ -42,6 +42,12 @@ class ClusterIntegrationTest {
 
     private static final Duration TICK = Duration.ofMillis(20);
 
+    /**
+     * Deliberately tiny. A production threshold would compact once an hour; this makes every test that
+     * writes more than a handful of keys cross the compaction paths.
+     */
+    private static final int SNAPSHOT_EVERY = 12;
+
     @TempDir Path root;
 
     private final List<KeelNode> nodes = new ArrayList<>();
@@ -135,12 +141,91 @@ class ClusterIntegrationTest {
                                         10,
                                         1,
                                         Duration.ofSeconds(5),
-                                        null))
+                                        null,
+                                        SNAPSHOT_EVERY))
                         .start();
         nodes.add(restarted);
 
         await(() -> restarted.keyCount() == 11, "the restarted node to catch up");
         assertEquals(11, restarted.keyCount());
+    }
+
+    @Test
+    @DisplayName("a follower that missed a compacted range is caught up from a snapshot")
+    void followerCatchesUpFromASnapshot() {
+        // Without compaction this is just replication. With it, the entries the follower needs are gone
+        // from the leader's log, so the only way to repair it is to ship the state machine.
+        startCluster(3);
+        KeelClient client = client();
+        client.openSession();
+        long victim = followerId();
+        Path dataDir = dataDirOf(victim);
+        stop(victim);
+
+        for (int i = 0; i < 60; i++) {
+            client.put("k" + i, "v" + i);
+        }
+        await(
+                () -> nodes.stream().anyMatch(node -> node.snapshotIndex() > 0),
+                "the leader to take a snapshot");
+
+        KeelNode restarted =
+                KeelNode.open(
+                                new NodeOptions(
+                                        victim,
+                                        cluster,
+                                        dataDir,
+                                        TICK,
+                                        10,
+                                        1,
+                                        Duration.ofSeconds(5),
+                                        null,
+                                        SNAPSHOT_EVERY))
+                        .start();
+        nodes.add(restarted);
+
+        await(() -> restarted.keyCount() == 60, "the follower to catch up from a snapshot");
+        assertTrue(
+                restarted.snapshotIndex() > 0,
+                "it should have been caught up by a snapshot, not by entries");
+        assertEquals(Optional.of("v42"), client.get("k42"));
+    }
+
+    @Test
+    @DisplayName("a node restarts from its own snapshot rather than replaying everything")
+    void restartsFromItsOwnSnapshot() {
+        startCluster(3);
+        KeelClient client = client();
+        client.openSession();
+        for (int i = 0; i < 40; i++) {
+            client.put("k" + i, "v" + i);
+        }
+        long victim = followerId();
+        await(() -> node(victim).snapshotIndex() > 0, "the follower to snapshot its own state");
+        Path dataDir = dataDirOf(victim);
+        long boundary = node(victim).snapshotIndex();
+        stop(victim);
+
+        KeelNode restarted =
+                KeelNode.open(
+                                new NodeOptions(
+                                        victim,
+                                        cluster,
+                                        dataDir,
+                                        TICK,
+                                        10,
+                                        1,
+                                        Duration.ofSeconds(5),
+                                        null,
+                                        SNAPSHOT_EVERY))
+                        .start();
+        nodes.add(restarted);
+
+        // The keys below the boundary can only be there because the snapshot was loaded: those log
+        // entries no longer exist.
+        assertTrue(restarted.snapshotIndex() >= boundary, "it should have restored from its snapshot");
+        await(() -> restarted.keyCount() == 40, "the restarted node to be complete");
+        assertEquals(Optional.of("v0"), client.get("k0"));
     }
 
     @Test
@@ -168,7 +253,15 @@ class ClusterIntegrationTest {
             nodes.add(
                     KeelNode.open(
                                     new NodeOptions(
-                                            id, cluster, dataDirs.get(i++), TICK, 10, 1, Duration.ofSeconds(5), null))
+                                            id,
+                                            cluster,
+                                            dataDirs.get(i++),
+                                            TICK,
+                                            10,
+                                            1,
+                                            Duration.ofSeconds(5),
+                                            null,
+                                            SNAPSHOT_EVERY))
                             .start());
         }
 
@@ -289,7 +382,16 @@ class ClusterIntegrationTest {
         }
         for (long id : cluster.keySet()) {
             NodeOptions options =
-                    new NodeOptions(id, cluster, dataDirOf(id), TICK, 10, 1, Duration.ofSeconds(5), null);
+                    new NodeOptions(
+                            id,
+                            cluster,
+                            dataDirOf(id),
+                            TICK,
+                            10,
+                            1,
+                            Duration.ofSeconds(5),
+                            null,
+                            SNAPSHOT_EVERY);
             nodes.add(KeelNode.open(options).start());
         }
         await(() -> leaderIdOrZero() != 0, "the cluster to elect a leader");
@@ -328,6 +430,10 @@ class ClusterIntegrationTest {
             }
         }
         return found;
+    }
+
+    private KeelNode node(long id) {
+        return nodes.stream().filter(node -> node.nodeId() == id).findFirst().orElseThrow();
     }
 
     private long followerId() {

@@ -2,6 +2,7 @@ package io.keel.raft;
 
 import io.keel.proto.log.Entry;
 import io.keel.proto.log.HardState;
+import io.keel.proto.log.SnapshotMetadata;
 import java.util.List;
 
 /**
@@ -10,6 +11,9 @@ import java.util.List;
  * <p>The order is not advisory. A driver must:
  *
  * <ol>
+ *   <li>install {@link #snapshotToInstall()} if present, <em>before</em> anything else: the entries in
+ *       this same batch are the ones that follow its boundary, and appending them into a log that
+ *       still starts lower down leaves a gap
  *   <li>write {@link #hardState()} if present
  *   <li>write {@link #entriesToPersist()}
  *   <li>make both durable
@@ -33,13 +37,18 @@ import java.util.List;
  * @param messages messages to put on the wire, valid only after the writes above are durable
  * @param readStates reads that have been given a safe index; each may be answered once the state
  *     machine has applied at least that index
+ * @param snapshotToInstall a snapshot this node has accepted from the leader, or {@code null}. When
+ *     present it must be installed into the state machine and the log <em>before</em>
+ *     {@link RaftNode#advance(Ready)}: the core has already moved its commit index to the snapshot
+ *     boundary, so a driver that acknowledges without installing has claimed state it does not have.
  */
 public record Ready(
         HardState hardState,
         List<Entry> entriesToPersist,
         List<Entry> committedEntries,
         List<RaftMessage> messages,
-        List<ReadState> readStates) {
+        List<ReadState> readStates,
+        SnapshotMetadata snapshotToInstall) {
 
     public Ready {
         entriesToPersist = List.copyOf(entriesToPersist);
@@ -54,11 +63,16 @@ public record Ready(
                 && entriesToPersist.isEmpty()
                 && committedEntries.isEmpty()
                 && messages.isEmpty()
-                && readStates.isEmpty();
+                && readStates.isEmpty()
+                && snapshotToInstall == null;
     }
 
     public boolean hasHardState() {
         return hardState != null;
+    }
+
+    public boolean hasSnapshotToInstall() {
+        return snapshotToInstall != null;
     }
 
     @Override
@@ -76,6 +90,9 @@ public record Ready(
                 + messages.size()
                 + " reads="
                 + readStates.size()
+                + (snapshotToInstall == null
+                        ? ""
+                        : " snapshot=" + snapshotToInstall.getLastIndex())
                 + "]";
     }
 }

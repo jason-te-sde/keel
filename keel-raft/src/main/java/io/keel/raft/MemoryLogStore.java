@@ -2,6 +2,7 @@ package io.keel.raft;
 
 import io.keel.proto.log.Entry;
 import io.keel.proto.log.HardState;
+import io.keel.proto.log.SnapshotMetadata;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -28,6 +29,8 @@ public final class MemoryLogStore implements LogStore {
     private HardState liveState = HardState.getDefaultInstance();
     private HardState durableState = HardState.getDefaultInstance();
 
+    private SnapshotMetadata snapshot = SnapshotMetadata.getDefaultInstance();
+
     /**
      * Lowest log index modified since the last sync, or {@link Long#MAX_VALUE} when clean. Tracking
      * it keeps sync and crash proportional to what actually changed instead of to the log length.
@@ -48,11 +51,17 @@ public final class MemoryLogStore implements LogStore {
     }
 
     @Override
+    public SnapshotMetadata snapshotMetadata() {
+        return snapshot;
+    }
+
+    @Override
     public long term(long index) {
         if (index == offset - 1) {
-            // The position just before the log: either the start of time or the last index a
-            // snapshot covered. Term 0 is correct for a fresh log.
-            return 0;
+            // The position just before the log: either the start of time, or the last index a snapshot
+            // covered. A fresh snapshot message has term 0, which is the right answer for a log that
+            // has never been compacted.
+            return snapshot.getLastTerm();
         }
         if (index < offset) {
             throw new CompactedException(index, offset);
@@ -151,6 +160,38 @@ public final class MemoryLogStore implements LogStore {
             durableState = liveState;
             stateDirty = false;
         }
+    }
+
+    @Override
+    public void compact(SnapshotMetadata meta) {
+        if (meta.getLastIndex() < offset - 1) {
+            throw new IllegalArgumentException(
+                    "snapshot at " + meta.getLastIndex() + " is behind the current boundary " + (offset - 1));
+        }
+        if (meta.getLastIndex() > lastIndex()) {
+            throw new IllegalArgumentException(
+                    "cannot compact to " + meta.getLastIndex() + " past the last index " + lastIndex());
+        }
+        // Compaction is a point of no return: the entries it drops only exist in the state machine
+        // snapshot from here on, so everything before it has to be durable first.
+        sync();
+        int drop = (int) (meta.getLastIndex() - offset + 1);
+        live.subList(0, drop).clear();
+        durable.subList(0, Math.min(drop, durable.size())).clear();
+        offset = meta.getLastIndex() + 1;
+        snapshot = meta;
+    }
+
+    @Override
+    public void installSnapshot(SnapshotMetadata meta) {
+        // Everything goes, not just the prefix. This node's log may have diverged from the leader's,
+        // so entries above the snapshot boundary are not known to be valid either.
+        live.clear();
+        durable.clear();
+        offset = meta.getLastIndex() + 1;
+        snapshot = meta;
+        dirtyFrom = Long.MAX_VALUE;
+        stateDirty = false;
     }
 
     /**

@@ -1,6 +1,7 @@
 package io.keel.raft;
 
 import io.keel.proto.log.Entry;
+import io.keel.proto.log.SnapshotMetadata;
 import java.util.ArrayList;
 import java.util.List;
 import org.slf4j.Logger;
@@ -30,6 +31,16 @@ final class RaftLog {
     private long committed;
     private long applied;
 
+    /**
+     * A snapshot accepted from the leader that the driver has not installed yet.
+     *
+     * <p>While it is set, it answers for the log's boundary instead of storage. The core has to be able
+     * to say "my log now starts after index N" the moment it accepts a snapshot, but storage does not
+     * change until the driver installs it, and reading a stale boundary in between would let the commit
+     * index appear to be past the end of the log.
+     */
+    private SnapshotMetadata pendingSnapshot;
+
     RaftLog(RaftStorage storage, long committed) {
         this.storage = storage;
         long last = storage.lastIndex();
@@ -48,17 +59,21 @@ final class RaftLog {
 
     /** Index of the first in-memory entry, or one past the durable end when there are none. */
     long unstableOffset() {
-        return unstable.isEmpty() ? storage.lastIndex() + 1 : unstable.get(0).getIndex();
+        if (!unstable.isEmpty()) {
+            return unstable.get(0).getIndex();
+        }
+        return (pendingSnapshot != null ? pendingSnapshot.getLastIndex() : storage.lastIndex()) + 1;
     }
 
     long firstIndex() {
-        return storage.firstIndex();
+        return pendingSnapshot != null ? pendingSnapshot.getLastIndex() + 1 : storage.firstIndex();
     }
 
     long lastIndex() {
-        return unstable.isEmpty()
-                ? storage.lastIndex()
-                : unstable.get(unstable.size() - 1).getIndex();
+        if (!unstable.isEmpty()) {
+            return unstable.get(unstable.size() - 1).getIndex();
+        }
+        return pendingSnapshot != null ? pendingSnapshot.getLastIndex() : storage.lastIndex();
     }
 
     long committed() {
@@ -82,6 +97,9 @@ final class RaftLog {
     long term(long index) {
         if (index == 0) {
             return 0;
+        }
+        if (pendingSnapshot != null && index == pendingSnapshot.getLastIndex()) {
+            return pendingSnapshot.getLastTerm();
         }
         long offset = unstableOffset();
         if (index >= offset) {
@@ -192,6 +210,12 @@ final class RaftLog {
             // Our log ends before the leader's previous entry. Ask for the gap to be filled.
             return AppendOutcome.rejected(lastIndex() + 1, 0);
         }
+        if (prevIndex < firstIndex() - 1) {
+            // Our snapshot already covers prevIndex, so the entry it refers to is gone. There is
+            // nothing to verify and nothing to gain: everything up to the boundary is committed
+            // already. Point the leader at the boundary and let it continue from there.
+            return AppendOutcome.rejected(firstIndex(), 0);
+        }
         if (!matchTerm(prevIndex, prevTerm)) {
             long conflictTerm;
             try {
@@ -226,6 +250,10 @@ final class RaftLog {
      */
     private long findConflict(List<Entry> entries) {
         for (Entry e : entries) {
+            if (e.getIndex() < firstIndex()) {
+                // Below our snapshot boundary, so already committed and not in conflict with anything.
+                continue;
+            }
             if (!matchTerm(e.getIndex(), e.getTerm())) {
                 if (e.getIndex() <= lastIndex()) {
                     LOG.debug(
@@ -305,6 +333,41 @@ final class RaftLog {
                     "applied index " + index + " exceeds commit index " + committed);
         }
         applied = index;
+    }
+
+    /**
+     * Accepts a snapshot from the leader, discarding the log entirely.
+     *
+     * <p>Everything goes, not just the prefix: this node's log may have diverged from the leader's, so
+     * entries above the snapshot boundary are not known to be valid either.
+     *
+     * <p>The commit and applied indexes move to the boundary immediately, which is a claim about state
+     * the driver has not installed yet. That is why {@link Ready#snapshotToInstall()} must be handled
+     * before {@code advance}.
+     */
+    void restore(SnapshotMetadata meta) {
+        if (meta.getLastIndex() < committed) {
+            throw new IllegalStateException(
+                    "snapshot at " + meta.getLastIndex() + " is behind the commit index " + committed);
+        }
+        LOG.info(
+                "restoring from a snapshot at index {} term {}",
+                meta.getLastIndex(),
+                meta.getLastTerm());
+        unstable.clear();
+        pendingSnapshot = meta;
+        committed = meta.getLastIndex();
+        applied = meta.getLastIndex();
+    }
+
+    /** The snapshot the driver still has to install, or null. */
+    SnapshotMetadata pendingSnapshot() {
+        return pendingSnapshot;
+    }
+
+    /** Called once the driver has made a restored snapshot durable and installed it. */
+    void snapshotInstalled() {
+        pendingSnapshot = null;
     }
 
     /** Entries the driver has not persisted yet. */

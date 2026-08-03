@@ -1,6 +1,5 @@
 package io.keel.node;
 
-import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
@@ -12,6 +11,9 @@ import io.keel.kv.StateMachine;
 import io.keel.proto.kv.CommandResult;
 import io.keel.proto.log.Entry;
 import io.keel.proto.log.EntryType;
+import io.keel.proto.log.SnapshotMetadata;
+import io.keel.proto.raft.InstallSnapshotAck;
+import io.keel.proto.raft.InstallSnapshotChunk;
 import io.keel.proto.raft.RaftEnvelope;
 import io.keel.proto.raft.RaftServiceGrpc;
 import io.keel.proto.raft.SendAck;
@@ -25,6 +27,9 @@ import io.keel.raft.Ready;
 import io.keel.raft.Status;
 import io.keel.storage.LogOptions;
 import io.keel.storage.SegmentedLog;
+import com.google.protobuf.ByteString;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.HashMap;
@@ -83,8 +88,14 @@ public final class KeelNode implements AutoCloseable {
     /** What a read returned, and the index it was answered at. */
     public record ReadAnswer(Optional<ByteString> value, long readIndex) {}
 
-    /** One peer's channel. */
-    private record PeerLink(ManagedChannel channel, RaftServiceGrpc.RaftServiceBlockingStub stub) {}
+    /** One peer's channel, with both a blocking stub and an async one for snapshot streams. */
+    private record PeerLink(
+            ManagedChannel channel,
+            RaftServiceGrpc.RaftServiceBlockingStub stub,
+            RaftServiceGrpc.RaftServiceStub asyncStub) {}
+
+    /** Bytes for a snapshot the leader is streaming to a follower, before its metadata is stepped. */
+    private static final int SNAPSHOT_CHUNK_BYTES = 256 * 1024;
 
     private final NodeOptions options;
     private final LogStore store;
@@ -97,6 +108,7 @@ public final class KeelNode implements AutoCloseable {
     private final ScheduledExecutorService ticker;
 
     private final Map<Long, PeerLink> peers = new HashMap<>();
+    private final SnapshotStore snapshots;
     private final LinkedBlockingQueue<Entry> applyQueue = new LinkedBlockingQueue<>();
     private final Map<Long, PendingWrite> pendingWrites = new ConcurrentHashMap<>();
     private final Map<Long, PendingRead> pendingReads = new ConcurrentHashMap<>();
@@ -104,13 +116,26 @@ public final class KeelNode implements AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean();
 
     private volatile long appliedIndex;
+
+    /** Boundary of the newest snapshot this node has taken, so the policy knows when to take another. */
+    private volatile long snapshotIndex;
+
+    /** Term of the highest entry applied, needed to label a snapshot. */
+    private volatile long lastAppliedTerm;
+
     private Server server;
 
-    private KeelNode(NodeOptions options, LogStore store, StateMachine stateMachine, RaftNode raft) {
+    private KeelNode(
+            NodeOptions options,
+            LogStore store,
+            StateMachine stateMachine,
+            RaftNode raft,
+            SnapshotStore snapshots) {
         this.options = options;
         this.store = store;
         this.stateMachine = stateMachine;
         this.raft = raft;
+        this.snapshots = snapshots;
         this.raftLoop = Executors.newSingleThreadExecutor(named("keel-raft-" + options.nodeId()));
         this.applyLoop = Executors.newSingleThreadExecutor(named("keel-apply-" + options.nodeId()));
         this.senders = Executors.newFixedThreadPool(4, named("keel-send-" + options.nodeId()));
@@ -131,7 +156,35 @@ public final class KeelNode implements AutoCloseable {
                         .heartbeatTicks(options.heartbeatTicks())
                         .build();
         RaftNode raft = RaftNode.restore(config, log, new Random(options.nodeId() * 7919L));
-        return new KeelNode(options, log, stateMachine, raft);
+        SnapshotStore snapshots = new SnapshotStore(options.dataDir().resolve("snapshots"));
+
+        // The log says where it was compacted to; the state machine has to be brought to the same
+        // point before any entry above it is replayed. If the log claims a boundary and no snapshot
+        // backs it up, the entries below it are gone and so is their effect: that is data loss, and
+        // starting anyway would hide it.
+        long boundary = log.snapshotMetadata().getLastIndex();
+        long restoredAt = 0;
+        if (boundary > 0) {
+            SnapshotStore.Stored stored =
+                    snapshots
+                            .latest()
+                            .filter(candidate -> candidate.meta().getLastIndex() >= boundary)
+                            .orElseThrow(
+                                    () ->
+                                            new IllegalStateException(
+                                                    "the log was compacted to index "
+                                                            + boundary
+                                                            + " but no snapshot covering it exists in "
+                                                            + options.dataDir().resolve("snapshots")));
+            stateMachine.restore(new ByteArrayInputStream(snapshots.read(stored)));
+            restoredAt = stored.meta().getLastIndex();
+            LOG.info("node {} restored its state machine from a snapshot at {}", options.nodeId(), restoredAt);
+        }
+
+        KeelNode node = new KeelNode(options, log, stateMachine, raft, snapshots);
+        node.appliedIndex = restoredAt;
+        node.snapshotIndex = restoredAt;
+        return node;
     }
 
     /** Starts the server, the tick timer, and the apply loop. */
@@ -146,7 +199,11 @@ public final class KeelNode implements AutoCloseable {
             ManagedChannel channel =
                     NettyChannelBuilder.forTarget(peer.getValue()).usePlaintext().build();
             peers.put(
-                    peer.getKey(), new PeerLink(channel, RaftServiceGrpc.newBlockingStub(channel)));
+                    peer.getKey(),
+                    new PeerLink(
+                            channel,
+                            RaftServiceGrpc.newBlockingStub(channel),
+                            RaftServiceGrpc.newStub(channel)));
         }
 
         try {
@@ -264,6 +321,11 @@ public final class KeelNode implements AutoCloseable {
         return appliedIndex;
     }
 
+    /** Boundary of the newest snapshot this node has taken or installed, or 0 if it has none. */
+    public long snapshotIndex() {
+        return snapshotIndex;
+    }
+
     // ---------------------------------------------------------------------------------------------
     // The raft thread
     // ---------------------------------------------------------------------------------------------
@@ -282,6 +344,11 @@ public final class KeelNode implements AutoCloseable {
         Ready ready = raft.ready();
         if (ready.isEmpty()) {
             return;
+        }
+        // First, because the entries in this same batch are the ones that follow the snapshot's
+        // boundary. Appending them into a log that still starts lower down would leave a gap.
+        if (ready.hasSnapshotToInstall()) {
+            installSnapshot(ready.snapshotToInstall());
         }
         if (ready.hasHardState()) {
             store.saveHardState(ready.hardState());
@@ -314,6 +381,16 @@ public final class KeelNode implements AutoCloseable {
         if (link == null) {
             return;
         }
+        if (message instanceof RaftMessage.InstallSnapshot snapshot) {
+            streamSnapshot(link, snapshot);
+            return;
+        }
+        if (message instanceof RaftMessage.InstallSnapshotReply) {
+            // The reply is the stream's return value, produced by the receiving node's own core and
+            // then discarded here. Sending it as a separate message would let the leader believe a
+            // follower holds a snapshot before the payload has landed.
+            return;
+        }
         RaftEnvelope envelope = RaftCodec.toWire(message);
         senders.execute(
                 () -> {
@@ -325,6 +402,155 @@ public final class KeelNode implements AutoCloseable {
                         // Raft treats a lost message as a lost message. Retries come from the next
                         // heartbeat, so there is nothing to do but note it.
                         LOG.debug("send to node {} failed: {}", message.to(), e.toString());
+                    }
+                });
+    }
+
+    /**
+     * Streams a snapshot payload to a follower and steps the outcome back into the core.
+     *
+     * <p>Runs off the raft thread: a snapshot is large and a follower may be slow, and stalling the
+     * thread that owns the core would stall the whole node.
+     */
+    private void streamSnapshot(PeerLink link, RaftMessage.InstallSnapshot message) {
+        senders.execute(
+                () -> {
+                    boolean landed = false;
+                    long matchIndex = 0;
+                    try {
+                        SnapshotStore.Stored stored =
+                                snapshots
+                                        .latest()
+                                        .filter(s -> s.meta().getLastIndex() >= message.meta().getLastIndex())
+                                        .orElseThrow(
+                                                () ->
+                                                        new IllegalStateException(
+                                                                "no snapshot on disk covering index "
+                                                                        + message.meta().getLastIndex()));
+                        byte[] payload = snapshots.read(stored);
+                        InstallSnapshotAck ack = sendChunks(link, message, stored.meta(), payload);
+                        landed = ack.getSuccess();
+                        matchIndex = ack.getMatchIndex();
+                    } catch (RuntimeException e) {
+                        LOG.warn("snapshot to node {} failed: {}", message.to(), e.toString());
+                    }
+                    long finalMatch = matchIndex;
+                    boolean finalLanded = landed;
+                    raftLoop.execute(
+                            () -> {
+                                raft.step(
+                                        new RaftMessage.InstallSnapshotReply(
+                                                message.to(),
+                                                options.nodeId(),
+                                                message.term(),
+                                                finalLanded,
+                                                finalMatch));
+                                drainReady();
+                            });
+                });
+    }
+
+    private InstallSnapshotAck sendChunks(
+            PeerLink link, RaftMessage.InstallSnapshot message, SnapshotMetadata meta, byte[] payload) {
+        java.util.concurrent.CompletableFuture<InstallSnapshotAck> answer = new CompletableFuture<>();
+        StreamObserver<InstallSnapshotChunk> stream =
+                link.asyncStub()
+                        .withDeadlineAfter(options.requestTimeout().toMillis() * 4, TimeUnit.MILLISECONDS)
+                        .installSnapshot(
+                                new StreamObserver<>() {
+                                    @Override
+                                    public void onNext(InstallSnapshotAck ack) {
+                                        answer.complete(ack);
+                                    }
+
+                                    @Override
+                                    public void onError(Throwable error) {
+                                        answer.completeExceptionally(error);
+                                    }
+
+                                    @Override
+                                    public void onCompleted() {
+                                        answer.complete(InstallSnapshotAck.getDefaultInstance());
+                                    }
+                                });
+        try {
+            for (int offset = 0; offset < Math.max(payload.length, 1); offset += SNAPSHOT_CHUNK_BYTES) {
+                int end = Math.min(offset + SNAPSHOT_CHUNK_BYTES, payload.length);
+                stream.onNext(
+                        InstallSnapshotChunk.newBuilder()
+                                .setTerm(message.term())
+                                .setLeaderId(options.nodeId())
+                                .setMeta(meta)
+                                .setOffset(offset)
+                                .setData(ByteString.copyFrom(payload, offset, end - offset))
+                                .setLast(end >= payload.length)
+                                .build());
+            }
+            stream.onCompleted();
+            return answer.get(options.requestTimeout().toMillis() * 4, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while sending a snapshot", e);
+        } catch (ExecutionException | java.util.concurrent.TimeoutException e) {
+            stream.onError(e);
+            throw new IllegalStateException("snapshot stream failed", e);
+        }
+    }
+
+    /** Installs a snapshot the core has accepted. Runs on the raft thread. */
+    private void installSnapshot(SnapshotMetadata meta) {
+        byte[] payload = receivedSnapshot;
+        if (payload == null) {
+            throw new IllegalStateException(
+                    "the core accepted a snapshot at " + meta.getLastIndex() + " with no payload received");
+        }
+        receivedSnapshot = null;
+        synchronized (stateMachine) {
+            stateMachine.restore(new ByteArrayInputStream(payload));
+        }
+        store.installSnapshot(meta);
+        appliedIndex = meta.getLastIndex();
+        snapshotIndex = meta.getLastIndex();
+        lastAppliedTerm = meta.getLastTerm();
+        LOG.info("node {} installed a snapshot at index {}", options.nodeId(), meta.getLastIndex());
+        satisfyReads();
+    }
+
+    /**
+     * Takes a snapshot and compacts the log once it has grown past the threshold.
+     *
+     * <p>The state machine is serialized first and the log compacted second, both because the snapshot
+     * has to be durable before the entries it replaces are dropped, and because compaction happens on
+     * the raft thread while snapshotting happens here.
+     */
+    private void maybeSnapshot() {
+        int threshold = options.snapshotThresholdEntries();
+        if (threshold == 0 || appliedIndex - snapshotIndex < threshold) {
+            return;
+        }
+        long boundary = appliedIndex;
+        long boundaryTerm = lastAppliedTerm;
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        synchronized (stateMachine) {
+            stateMachine.snapshot(out);
+        }
+        SnapshotMetadata meta =
+                snapshots.write(
+                        SnapshotMetadata.newBuilder()
+                                .setLastIndex(boundary)
+                                .setLastTerm(boundaryTerm)
+                                .build(),
+                        out.toByteArray());
+        snapshotIndex = boundary;
+        raftLoop.execute(
+                () -> {
+                    try {
+                        store.compact(meta);
+                        store.sync();
+                    } catch (RuntimeException e) {
+                        // Failing to compact costs disk, not correctness: the snapshot is already
+                        // durable and the entries it covers are still there.
+                        LOG.warn("could not compact to index {}: {}", meta.getLastIndex(), e.toString());
                     }
                 });
     }
@@ -370,7 +596,9 @@ public final class KeelNode implements AutoCloseable {
             }
         }
         appliedIndex = entry.getIndex();
+        lastAppliedTerm = entry.getTerm();
         satisfyReads();
+        maybeSnapshot();
     }
 
     /** Answers reads whose index the state machine has reached. Safe to call from either thread. */
@@ -396,8 +624,92 @@ public final class KeelNode implements AutoCloseable {
     // Transport
     // ---------------------------------------------------------------------------------------------
 
+    /** Payload of a snapshot received but not yet accepted by the core. */
+    private volatile byte[] receivedSnapshot;
+
     /** Receives consensus messages and hands them to the thread that owns the core. */
     private final class RaftTransport extends RaftServiceGrpc.RaftServiceImplBase {
+
+        @Override
+        public StreamObserver<InstallSnapshotChunk> installSnapshot(
+                StreamObserver<InstallSnapshotAck> responseObserver) {
+            return new StreamObserver<>() {
+                private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                private SnapshotMetadata meta;
+
+                @Override
+                public void onNext(InstallSnapshotChunk chunk) {
+                    meta = chunk.getMeta();
+                    byte[] data = chunk.getData().toByteArray();
+                    buffer.write(data, 0, data.length);
+                }
+
+                @Override
+                public void onError(Throwable error) {
+                    LOG.warn("a snapshot stream failed: {}", error.toString());
+                }
+
+                @Override
+                public void onCompleted() {
+                    if (meta == null) {
+                        responseObserver.onNext(InstallSnapshotAck.getDefaultInstance());
+                        responseObserver.onCompleted();
+                        return;
+                    }
+                    SnapshotMetadata received = meta;
+                    byte[] payload = buffer.toByteArray();
+                    // Durable and verified before the core is told about it, so the acknowledgement
+                    // means installed rather than merely received.
+                    SnapshotMetadata stored;
+                    try {
+                        stored = snapshots.accept(received, payload);
+                    } catch (RuntimeException e) {
+                        LOG.warn("rejecting a snapshot: {}", e.toString());
+                        responseObserver.onNext(
+                                InstallSnapshotAck.newBuilder()
+                                        .setFollowerId(options.nodeId())
+                                        .setSuccess(false)
+                                        .build());
+                        responseObserver.onCompleted();
+                        return;
+                    }
+                    receivedSnapshot = payload;
+                    raftLoop.execute(
+                            () -> {
+                                try {
+                                    raft.step(
+                                            new RaftMessage.InstallSnapshot(
+                                                    received.getLastIndex() == 0 ? 0 : receivedFrom(received),
+                                                    options.nodeId(),
+                                                    Math.max(received.getLastTerm(), raft.term()),
+                                                    stored));
+                                    drainReady();
+                                    responseObserver.onNext(
+                                            InstallSnapshotAck.newBuilder()
+                                                    .setTerm(raft.term())
+                                                    .setFollowerId(options.nodeId())
+                                                    .setSuccess(true)
+                                                    .setMatchIndex(Math.max(raft.commitIndex(), stored.getLastIndex()))
+                                                    .build());
+                                } catch (RuntimeException e) {
+                                    LOG.warn("failed to install a snapshot", e);
+                                    responseObserver.onNext(
+                                            InstallSnapshotAck.newBuilder()
+                                                    .setFollowerId(options.nodeId())
+                                                    .setSuccess(false)
+                                                    .build());
+                                }
+                                responseObserver.onCompleted();
+                            });
+                }
+            };
+        }
+
+        /** The leader this snapshot came from, which is whoever the node currently follows. */
+        private long receivedFrom(SnapshotMetadata meta) {
+            long leader = raft.leaderId();
+            return leader == 0 ? options.nodeId() : leader;
+        }
         @Override
         public void send(RaftEnvelope request, StreamObserver<SendAck> responseObserver) {
             // Acknowledge receipt straight away. The consensus answer, if there is one, travels back as

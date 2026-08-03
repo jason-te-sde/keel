@@ -35,10 +35,13 @@ public final class Invariants {
     private final Map<Long, Long> highestTerm = new HashMap<>();
     private final Map<Long, Long> highestCommit = new HashMap<>();
 
-    /** Everything each node has ever applied, so a rewritten prefix can be spotted. */
-    private final Map<Long, List<Entry>> appliedHistory = new HashMap<>();
-
-    /** Commands agreed at each index, so two replicas cannot disagree about one. */
+    /**
+     * Commands applied at each index, by anyone, ever.
+     *
+     * <p>Keyed by log index rather than by position in a node's history, which matters once snapshots
+     * exist: a node that catches up from a snapshot starts applying at a higher index, so its history
+     * no longer lines up positionally with what it applied before. Indexes always line up.
+     */
     private final Map<Long, Entry> committedByIndex = new HashMap<>();
 
     private long checks;
@@ -121,36 +124,52 @@ public final class Invariants {
         }
     }
 
+    /**
+     * Log Matching, compared by log index rather than by position in the list.
+     *
+     * <p>Once compaction exists, two nodes' durable logs start at different indexes, and a positional
+     * comparison silently compares index 5 on one node against index 1 on another. Only the range both
+     * logs actually hold can be compared; entries below a node's snapshot boundary are committed and
+     * gone, which is not a disagreement.
+     */
     private void logMatching(long tick, List<NodeView> views) {
         for (int i = 0; i < views.size(); i++) {
             for (int j = i + 1; j < views.size(); j++) {
-                List<Entry> a = views.get(i).durable();
-                List<Entry> b = views.get(j).durable();
-                int shared = Math.min(a.size(), b.size());
-                // Walk down from the highest shared index to the first agreement on term. From there
-                // the paper's induction says the prefixes must be identical.
-                for (int k = shared - 1; k >= 0; k--) {
-                    if (a.get(k).getTerm() != b.get(k).getTerm()) {
+                NodeView a = views.get(i);
+                NodeView b = views.get(j);
+                if (a.durable().isEmpty() || b.durable().isEmpty()) {
+                    continue;
+                }
+                long lo = Math.max(firstIndexOf(a), firstIndexOf(b));
+                long hi = Math.min(lastIndexOf(a), lastIndexOf(b));
+                if (lo > hi) {
+                    continue;
+                }
+                // Walk down to the highest index where the terms agree. From there the paper's
+                // induction says the prefixes must be identical.
+                for (long index = hi; index >= lo; index--) {
+                    if (entryAt(a, index).getTerm() != entryAt(b, index).getTerm()) {
                         continue;
                     }
-                    for (int p = 0; p <= k; p++) {
-                        Entry left = a.get(p);
-                        Entry right = b.get(p);
-                        if (left.getTerm() != right.getTerm() || !left.getData().equals(right.getData())) {
+                    for (long check = lo; check <= index; check++) {
+                        Entry left = entryAt(a, check);
+                        Entry right = entryAt(b, check);
+                        if (left.getTerm() != right.getTerm()
+                                || !left.getData().equals(right.getData())) {
                             throw new InvariantViolation(
                                     "Log Matching",
                                     seed,
                                     tick,
                                     "nodes "
-                                            + views.get(i).id()
+                                            + a.id()
                                             + " and "
-                                            + views.get(j).id()
+                                            + b.id()
                                             + " agree at index "
-                                            + (k + 1)
+                                            + index
                                             + " in term "
-                                            + a.get(k).getTerm()
+                                            + entryAt(a, index).getTerm()
                                             + " but differ at index "
-                                            + (p + 1));
+                                            + check);
                         }
                     }
                     break;
@@ -159,39 +178,22 @@ public final class Invariants {
         }
     }
 
+    private static long firstIndexOf(NodeView view) {
+        return view.durable().get(0).getIndex();
+    }
+
+    private static long lastIndexOf(NodeView view) {
+        return view.durable().get(view.durable().size() - 1).getIndex();
+    }
+
+    /** Entries are contiguous, so an index maps straight to a position. */
+    private static Entry entryAt(NodeView view, long index) {
+        return view.durable().get((int) (index - firstIndexOf(view)));
+    }
+
     private void stateMachineSafety(long tick, List<NodeView> views) {
         for (NodeView view : views) {
-            List<Entry> applied = view.applied();
-            List<Entry> before = appliedHistory.get(view.id());
-
-            if (before != null && !view.down()) {
-                // A node may restart and replay from the start, so a shorter list is legitimate. What
-                // is not legitimate is a different command at a position that was already applied.
-                int shared = Math.min(before.size(), applied.size());
-                for (int i = 0; i < shared; i++) {
-                    if (!sameCommand(before.get(i), applied.get(i))) {
-                        throw new InvariantViolation(
-                                "State Machine Safety",
-                                seed,
-                                tick,
-                                "node "
-                                        + view.id()
-                                        + " applied index "
-                                        + applied.get(i).getIndex()
-                                        + " a second time with different content: was term "
-                                        + before.get(i).getTerm()
-                                        + ", now term "
-                                        + applied.get(i).getTerm());
-                    }
-                }
-                if (applied.size() >= before.size()) {
-                    appliedHistory.put(view.id(), applied);
-                }
-            } else if (!view.down()) {
-                appliedHistory.put(view.id(), applied);
-            }
-
-            for (Entry entry : applied) {
+            for (Entry entry : view.applied()) {
                 Entry agreed = committedByIndex.putIfAbsent(entry.getIndex(), entry);
                 if (agreed != null && !sameCommand(agreed, entry)) {
                     throw new InvariantViolation(
@@ -202,10 +204,15 @@ public final class Invariants {
                                     + entry.getIndex()
                                     + " was applied as term "
                                     + agreed.getTerm()
-                                    + " by one replica and term "
+                                    + " with "
+                                    + agreed.getData().size()
+                                    + " bytes, and node "
+                                    + view.id()
+                                    + " applied it as term "
                                     + entry.getTerm()
-                                    + " by node "
-                                    + view.id());
+                                    + " with "
+                                    + entry.getData().size()
+                                    + " bytes");
                 }
             }
         }

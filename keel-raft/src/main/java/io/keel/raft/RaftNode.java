@@ -2,6 +2,7 @@ package io.keel.raft;
 
 import io.keel.proto.log.Entry;
 import io.keel.proto.log.HardState;
+import io.keel.proto.log.SnapshotMetadata;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -40,6 +41,7 @@ public final class RaftNode {
     public static final long NO_NODE = 0L;
 
     private final RaftConfig cfg;
+    private final RaftStorage storage;
     private final RaftLog log;
     private final Random random;
 
@@ -100,7 +102,7 @@ public final class RaftNode {
     public RaftNode(RaftConfig cfg, RaftStorage storage, HardState persisted, Random random) {
         this.cfg = Objects.requireNonNull(cfg, "cfg");
         this.random = Objects.requireNonNull(random, "random");
-        Objects.requireNonNull(storage, "storage");
+        this.storage = Objects.requireNonNull(storage, "storage");
         Objects.requireNonNull(persisted, "persisted");
 
         // Sorted so every iteration of the membership, and therefore the order messages are
@@ -208,6 +210,12 @@ public final class RaftNode {
                     handleHeartbeatReply(h);
                 }
             }
+            case RaftMessage.InstallSnapshot s -> handleInstallSnapshot(s);
+            case RaftMessage.InstallSnapshotReply s -> {
+                if (role == Role.LEADER) {
+                    handleInstallSnapshotReply(s);
+                }
+            }
             case RaftMessage.ReadIndexRequest r -> {
                 if (role == Role.LEADER) {
                     beginRead(r.from(), r.requestId());
@@ -311,7 +319,8 @@ public final class RaftNode {
                         log.unstableEntries(),
                         log.nextCommittedEntries(),
                         List.copyOf(outbound),
-                        List.copyOf(readStates));
+                        List.copyOf(readStates),
+                        log.pendingSnapshot());
         outbound.clear();
         readStates.clear();
         return rd;
@@ -335,6 +344,10 @@ public final class RaftNode {
         }
         if (rd.hasHardState()) {
             hardStateDirty = false;
+        }
+        if (rd.hasSnapshotToInstall()) {
+            // The driver has installed it, so storage is authoritative again.
+            log.snapshotInstalled();
         }
     }
 
@@ -434,6 +447,10 @@ public final class RaftNode {
                                     cfg.nodeId(), a.from(), term, false, 0, 0, 0));
             case RaftMessage.Heartbeat h ->
                     send(new RaftMessage.HeartbeatReply(cfg.nodeId(), h.from(), term, h.readSeq()));
+            case RaftMessage.InstallSnapshot s ->
+                    send(
+                            new RaftMessage.InstallSnapshotReply(
+                                    cfg.nodeId(), s.from(), term, false, 0));
             default -> LOG.debug(
                     "node {} ignoring {} from term {} (current term {})",
                     cfg.nodeId(),
@@ -770,15 +787,19 @@ public final class RaftNode {
         if (p == null || p.paused()) {
             return;
         }
+        if (p.next < log.firstIndex()) {
+            // This follower needs entries that compaction has removed. Sending anything else would
+            // only be rejected, and the rejection would rewind progress the snapshot is about to fix.
+            sendSnapshot(peer, p);
+            return;
+        }
         long prevIndex = p.next - 1;
         long prevTerm;
         try {
             prevTerm = log.term(prevIndex);
         } catch (RaftStorage.CompactedException e) {
-            // The follower needs entries this leader has already discarded, which is what snapshots
-            // are for. Until they exist, this is a programming error rather than a runtime state.
-            throw new IllegalStateException(
-                    "node " + peer + " needs index " + p.next + ", which has been compacted", e);
+            sendSnapshot(peer, p);
+            return;
         }
 
         long hi = Math.min(log.lastIndex() + 1, p.next + cfg.maxEntriesPerAppend());
@@ -793,6 +814,82 @@ public final class RaftNode {
             // Optimistic pipelining: assume acceptance and keep sending. A rejection rewinds next.
             p.next = Entries.lastIndex(entries) + 1;
         }
+    }
+
+    /**
+     * Starts catching a follower up from a snapshot rather than from entries.
+     *
+     * <p>Only the metadata goes on the wire from the core's point of view. Moving the payload is the
+     * driver's job: a snapshot is arbitrarily large, and the core has no I/O. What the core decides is
+     * when a snapshot is needed and which boundary it establishes.
+     */
+    private void sendSnapshot(long peer, Progress p) {
+        SnapshotMetadata meta = snapshotMetadata();
+        if (meta.getLastIndex() == 0) {
+            // Nothing has been compacted, so the entries this follower wants should still exist. If
+            // they do not, the log and the snapshot boundary disagree and continuing would be guessing.
+            throw new IllegalStateException(
+                    "node "
+                            + peer
+                            + " needs index "
+                            + p.next
+                            + " but there is no snapshot and the log starts at "
+                            + log.firstIndex());
+        }
+        LOG.info(
+                "node {} sending a snapshot at index {} to node {}",
+                cfg.nodeId(),
+                meta.getLastIndex(),
+                peer);
+        p.becomeSnapshot(meta.getLastIndex());
+        send(new RaftMessage.InstallSnapshot(cfg.nodeId(), peer, term, meta));
+    }
+
+    private void handleInstallSnapshot(RaftMessage.InstallSnapshot message) {
+        if (role != Role.FOLLOWER) {
+            becomeFollower(message.term(), message.from());
+        }
+        leaderId = message.from();
+        electionElapsed = 0;
+
+        SnapshotMetadata meta = message.meta();
+        if (meta.getLastIndex() <= log.committed()) {
+            // Already covered by what this node has committed. Reporting the higher index keeps the
+            // leader from sending the same snapshot again.
+            send(
+                    new RaftMessage.InstallSnapshotReply(
+                            cfg.nodeId(), message.from(), term, true, log.committed()));
+            return;
+        }
+        log.restore(meta);
+        hardStateDirty = true;
+        send(
+                new RaftMessage.InstallSnapshotReply(
+                        cfg.nodeId(), message.from(), term, true, meta.getLastIndex()));
+    }
+
+    private void handleInstallSnapshotReply(RaftMessage.InstallSnapshotReply reply) {
+        Progress p = peers.get(reply.from());
+        if (p == null) {
+            return;
+        }
+        p.recentActive = true;
+        if (reply.success()) {
+            p.maybeUpdate(reply.matchIndex());
+            p.snapshotFinished(true);
+            maybeCommit();
+            if (p.next <= log.lastIndex()) {
+                sendAppend(reply.from());
+            }
+        } else {
+            LOG.info("node {} refused a snapshot; will retry", reply.from());
+            p.snapshotFinished(false);
+        }
+    }
+
+    /** The snapshot boundary the log has been compacted to, or a zeroed message. */
+    public SnapshotMetadata snapshotMetadata() {
+        return storage.snapshotMetadata();
     }
 
     /** Advances the commit index if a majority has stored an entry from the current term. */

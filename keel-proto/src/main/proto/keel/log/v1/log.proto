@@ -66,6 +66,10 @@ message Record {
   oneof kind {
     Entry entry = 1;
     HardState state = 2;
+    // Marks the point the log was compacted to. Everything at or below
+    // last_index is in the state machine snapshot instead of the log, so replay
+    // discards earlier entry records rather than trusting them.
+    SnapshotMetadata snapshot = 3;
   }
 }
 
