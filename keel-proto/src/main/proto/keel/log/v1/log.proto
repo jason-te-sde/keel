@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package keel.log.v1;
+
+option java_package = "io.keel.proto.log";
+option java_outer_classname = "LogProto";
+option java_multiple_files = true;
+
+// Types in this file are written to disk. Changing a field number or reusing a
+// retired one breaks recovery of an existing data directory, so both are
+// forbidden; add a new field instead.
+
+// A log holds more than client commands. NOOP is what a new leader appends to
+// commit an entry in its own term, which is required both by the commit rule
+// (Raft 5.4.2) and by ReadIndex. CONF_CHANGE carries a membership change that
+// takes effect when it is applied, not when it is appended.
+enum EntryType {
+  ENTRY_TYPE_UNSPECIFIED = 0;
+  ENTRY_TYPE_NORMAL = 1;
+  ENTRY_TYPE_NOOP = 2;
+  ENTRY_TYPE_CONF_CHANGE = 3;
+}
+
+message Entry {
+  uint64 index = 1;
+  uint64 term = 2;
+  EntryType type = 3;
+  bytes data = 4;
+}
+
+// State a node must have durable before it acts on it: a vote that is lost in a
+// crash lets the node vote twice in one term, which is how two leaders happen.
+// `vote` is 0 when no vote has been cast; node ids start at 1, so 0 is a usable
+// sentinel.
+message HardState {
+  uint64 term = 1;
+  uint64 vote = 2;
+  uint64 commit = 3;
+}
+
+message ConfState {
+  repeated uint64 voters = 1;
+}
+
+message SnapshotMetadata {
+  uint64 last_index = 1;
+  uint64 last_term = 2;
+  // Membership as of last_index. A node restoring from a snapshot cannot
+  // recover this from the log, because the log prefix it would need is gone.
+  ConfState conf = 3;
+  uint64 size_bytes = 4;
+  fixed64 checksum = 5;
+}
+
+message ConfChange {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_ADD_VOTER = 1;
+    TYPE_REMOVE_VOTER = 2;
+  }
+  Type type = 1;
+  uint64 node_id = 2;
+  // Advertised address of the node being added, so peers can reach it without
+  // separate out-of-band configuration.
+  string address = 3;
+}

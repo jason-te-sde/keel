@@ -1,0 +1,19 @@
+# Maven build output
+target/
+
+# Generated protobuf and gRPC sources live under target/ and are never committed.
+# The .proto files are the source of truth.
+
+# Local scratch data written by keeld
+/data/
+*.keel-data/
+
+# Editor and OS noise
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Native crash logs
+hs_err_pid*.log
+replay_pid*.log
