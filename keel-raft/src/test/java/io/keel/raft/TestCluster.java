@@ -35,6 +35,7 @@ final class TestCluster {
         final long id;
         final MemoryLogStore store = new MemoryLogStore();
         final List<Entry> applied = new ArrayList<>();
+        final List<ReadState> reads = new ArrayList<>();
         RaftNode raft;
         boolean crashed;
 
@@ -192,6 +193,7 @@ final class TestCluster {
         m.store.sync();
         wire.addAll(rd.messages());
         m.applied.addAll(rd.committedEntries());
+        m.reads.addAll(rd.readStates());
         m.raft.advance(rd);
         return true;
     }
@@ -319,6 +321,11 @@ final class TestCluster {
             throw new IllegalArgumentException("no such node: " + id);
         }
         return m;
+    }
+
+    /** Read indexes this node has been granted, in the order they were answered. */
+    List<ReadState> reads(long id) {
+        return member(id).reads;
     }
 
     RaftNode node(long id) {

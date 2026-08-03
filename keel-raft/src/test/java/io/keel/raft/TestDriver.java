@@ -17,6 +17,7 @@ final class TestDriver {
 
     final MemoryLogStore store = new MemoryLogStore();
     final List<Entry> applied = new ArrayList<>();
+    final List<ReadState> reads = new ArrayList<>();
     RaftNode raft;
 
     private final RaftConfig cfg;
@@ -51,6 +52,7 @@ final class TestDriver {
             store.sync();
             sent.addAll(rd.messages());
             applied.addAll(rd.committedEntries());
+            reads.addAll(rd.readStates());
             raft.advance(rd);
         }
         throw new IllegalStateException("node never went quiet: " + raft);
