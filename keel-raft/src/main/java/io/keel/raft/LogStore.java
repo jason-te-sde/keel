@@ -21,7 +21,7 @@ import java.util.List;
  * crash before the data reaches the disk, come back with a log that is missing an entry a quorum
  * counted, and a committed value disappears.
  */
-public interface LogStore extends RaftStorage {
+public interface LogStore extends RaftStorage, AutoCloseable {
 
     /**
      * Appends entries, first discarding anything at or above {@code entries.get(0).getIndex()}.
@@ -43,4 +43,15 @@ public interface LogStore extends RaftStorage {
 
     /** Makes every preceding write durable. */
     void sync();
+
+    /**
+     * Releases any resources held by the store. Implementations backed by memory need do nothing.
+     *
+     * <p>Deliberately does not sync. Closing without syncing loses unsynced writes, which is the same
+     * outcome as a crash and is exactly what a test needs to be able to arrange. It also narrows
+     * {@link AutoCloseable#close()} to throw nothing, so callers are not forced into catch blocks
+     * that can never fire.
+     */
+    @Override
+    default void close() {}
 }

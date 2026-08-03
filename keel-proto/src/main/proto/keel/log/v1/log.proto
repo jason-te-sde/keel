@@ -52,6 +52,23 @@ message SnapshotMetadata {
   fixed64 checksum = 5;
 }
 
+// One framed unit in the write-ahead log.
+//
+// Entries and hard state share a single log so that both become durable in one
+// fsync. Keeping the term and vote in a separate file would mean either two
+// syncs per batch or a window where a recovered commit index refers to entries
+// that are not there.
+//
+// The log is strictly append-only: an entry record at an index that already
+// exists supersedes the earlier one during replay. Nothing is ever rewritten in
+// place, so a crash can only ever lose a suffix.
+message Record {
+  oneof kind {
+    Entry entry = 1;
+    HardState state = 2;
+  }
+}
+
 message ConfChange {
   enum Type {
     TYPE_UNSPECIFIED = 0;
