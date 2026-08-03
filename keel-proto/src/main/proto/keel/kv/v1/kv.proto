@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package keel.kv.v1;
+
+option java_package = "io.keel.proto.kv";
+option java_outer_classname = "KvProto";
+option java_multiple_files = true;
+
+// Commands are written into the Raft log and replayed on every replica, so this
+// schema is an on-disk format as much as a wire format. Field numbers are
+// permanent.
+
+// Identifies a client and where in its own sequence a request sits.
+//
+// This is what makes a retry safe. Consensus agrees an order for commands; it
+// does not stop a client that timed out from submitting the same command twice.
+// For a blind Put that is harmless, but a compare-and-swap applied twice is a
+// different outcome, and a linearizability check will find it.
+message Session {
+  uint64 client_id = 1;
+  // Per-client counter, starting at 1. A request whose sequence has already been
+  // applied returns the stored response instead of being applied again.
+  uint64 sequence = 2;
+}
+
+message PutCommand {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message DeleteCommand {
+  bytes key = 1;
+}
+
+// Compare and swap. Exactly one of expected or expect_absent describes the
+// precondition, which is why they are not both plain bytes: an empty expected
+// value and "no value at all" are different preconditions.
+message CasCommand {
+  bytes key = 1;
+  bytes expected = 2;
+  bool expect_absent = 3;
+  bytes value = 4;
+  // When set, a successful compare removes the key instead of writing value.
+  bool delete_on_match = 5;
+}
+
+message RegisterClientCommand {}
+
+message Command {
+  Session session = 1;
+  oneof kind {
+    PutCommand put = 2;
+    DeleteCommand delete = 3;
+    CasCommand cas = 4;
+    RegisterClientCommand register_client = 5;
+  }
+}
+
+message CommandResult {
+  // False when a precondition failed. A rejected compare-and-swap is a normal
+  // outcome, not an error: it is deterministic and every replica reaches it.
+  bool applied = 1;
+  bool found = 2;
+  bytes value = 3;
+  // Set by register_client. The client id is the log index the registration was
+  // assigned, which needs no counter and is identical on every replica.
+  uint64 client_id = 4;
+  string message = 5;
+}
+
+message SnapshotSession {
+  uint64 client_id = 1;
+  uint64 sequence = 2;
+  uint64 last_applied_index = 3;
+  CommandResult result = 4;
+}
+
+message SnapshotPair {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+// A full state machine snapshot. Sessions are part of it: a deduplication table
+// that only exists in the leader's memory is not a deduplication table, since a
+// replica that takes over would apply retries a second time.
+message KvSnapshot {
+  repeated SnapshotPair pairs = 1;
+  repeated SnapshotSession sessions = 2;
+  uint64 last_applied_index = 3;
+}
