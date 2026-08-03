@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package keel.raft.v1;
+
+import "keel/log/v1/log.proto";
+
+option java_package = "io.keel.proto.raft";
+option java_outer_classname = "RaftProto";
+option java_multiple_files = true;
+
+// Peer-to-peer consensus traffic. Not for clients.
+//
+// These are wire types only. The core has its own sealed message set, which is
+// what gives a dispatch over messages compile-time exhaustiveness; a protobuf
+// oneof cannot. The codec in keel-node converts between the two, and that seam is
+// also what keeps the simulator free of serialization.
+
+message VoteRequest {
+  // A pre-vote is a poll: it asks whether a real vote would be granted, without
+  // anyone incrementing their term. Without it, a node partitioned from the
+  // cluster raises its term on every election timeout and disrupts everyone when
+  // the partition heals (paper 9.6).
+  bool pre_vote = 1;
+  uint64 term = 2;
+  uint64 candidate_id = 3;
+  uint64 last_log_index = 4;
+  uint64 last_log_term = 5;
+}
+
+message VoteResponse {
+  uint64 term = 1;
+  bool granted = 2;
+  bool pre_vote = 3;
+  uint64 voter_id = 4;
+}
+
+message AppendRequest {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated keel.log.v1.Entry entries = 5;
+  uint64 leader_commit = 6;
+}
+
+message AppendResponse {
+  uint64 term = 1;
+  bool accepted = 2;
+  uint64 follower_id = 3;
+  // Highest index known to match the leader, valid when accepted.
+  uint64 match_index = 4;
+  // On rejection, where the follower's log diverges. Reporting the first index of
+  // the conflicting term lets the leader skip a whole term per round trip instead
+  // of backing up one index at a time.
+  uint64 conflict_index = 5;
+  uint64 conflict_term = 6;
+}
+
+message HeartbeatRequest {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 leader_commit = 3;
+  // Read-round token, echoed back. ReadIndex has to count responses belonging to
+  // one specific round; without the token a late response from an earlier round
+  // could be counted toward the current one and a stale read served.
+  uint64 read_seq = 4;
+}
+
+message HeartbeatResponse {
+  uint64 term = 1;
+  uint64 follower_id = 2;
+  uint64 read_seq = 3;
+}
+
+message ReadIndexRequest {
+  uint64 term = 1;
+  uint64 follower_id = 2;
+  uint64 request_id = 3;
+}
+
+message ReadIndexResponse {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 request_id = 3;
+  uint64 read_index = 4;
+}
+
+// Any consensus message, in one wrapper.
+//
+// The transport is one-way because the core is. A node emits messages and never
+// waits for a return value: a vote response is a message in its own right, not the
+// result of a call. Modelling that as request/response would mean holding a caller
+// on a socket while the core decides whether to answer at all, and ReadIndex makes
+// that concrete, since its answer arrives only after a later heartbeat round has
+// been confirmed by a quorum.
+message RaftEnvelope {
+  oneof message {
+    VoteRequest vote = 1;
+    VoteResponse vote_response = 2;
+    AppendRequest append = 3;
+    AppendResponse append_response = 4;
+    HeartbeatRequest heartbeat = 5;
+    HeartbeatResponse heartbeat_response = 6;
+    ReadIndexRequest read_index = 7;
+    ReadIndexResponse read_index_response = 8;
+  }
+}
+
+message SendAck {}
+
+service RaftService {
+  // Delivers one message. The acknowledgement means "received", never "agreed":
+  // consensus decisions travel as further messages.
+  rpc Send(RaftEnvelope) returns (SendAck);
+}

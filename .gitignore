@@ -17,3 +17,6 @@ target/
 # Native crash logs
 hs_err_pid*.log
 replay_pid*.log
+
+# Local cluster scratch data from scripts/local-cluster.sh
+/run/
