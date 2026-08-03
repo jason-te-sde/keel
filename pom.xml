@@ -28,6 +28,7 @@
     <module>keel-raft</module>
     <module>keel-storage</module>
     <module>keel-kv</module>
+    <module>keel-testkit</module>
   </modules>
 
   <properties>
