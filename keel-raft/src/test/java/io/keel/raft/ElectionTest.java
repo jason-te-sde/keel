@@ -189,6 +189,21 @@ class ElectionTest {
         }
     }
 
+    @Test
+    @DisplayName("vote requests are emitted in ascending recipient order")
+    void voteRequestsAreOrdered() {
+        // Guards the same property from the other side: given sorted membership, the messages a
+        // campaign produces have to come out in a defined order for a simulated run to be replayable.
+        RaftConfig cfg = RaftConfig.builder(1).voters(java.util.Set.of(5L, 1L, 3L, 9L)).preVote(false).build();
+        TestDriver d = new TestDriver(cfg, 11);
+
+        d.raft.campaign();
+        java.util.List<Long> recipients =
+                TestDriver.only(d.pump(), RaftMessage.Vote.class).stream().map(RaftMessage.Vote::to).toList();
+
+        assertEquals(java.util.List.of(3L, 5L, 9L), recipients);
+    }
+
     private static long firstFollower(TestCluster c, long leader) {
         for (long id : c.ids()) {
             if (id != leader) {
