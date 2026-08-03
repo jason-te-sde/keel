@@ -1,6 +1,8 @@
 package io.keel.raft;
 
+import java.util.Collections;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * A snapshot of one node's consensus state, for tests, invariant checks, and the status command.
@@ -25,7 +27,8 @@ public record Status(
         Set<Long> voters) {
 
     public Status {
-        voters = Set.copyOf(voters);
+        // Sorted so status output is stable between runs and between nodes.
+        voters = Collections.unmodifiableSet(new TreeSet<>(voters));
     }
 
     public boolean isLeader() {

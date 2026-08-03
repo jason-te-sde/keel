@@ -3,6 +3,7 @@ package io.keel.raft;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -36,6 +37,18 @@ class RaftConfigTest {
                         IllegalArgumentException.class,
                         () -> RaftConfig.builder(9).voters(1, 2, 3).build());
         assertEquals(true, e.getMessage().contains("must contain this node"), e.getMessage());
+    }
+
+    @Test
+    @DisplayName("voters iterate in ascending id order, whatever order they were given in")
+    void votersAreSorted() {
+        // Not cosmetic. The core iterates the membership to decide the order it sends vote requests
+        // and heartbeats in, and Set.of and Set.copyOf randomize iteration order per JVM on purpose.
+        // Leaving that unsorted made a cluster's message ordering differ between JVM invocations,
+        // which a determinism test running both replays in one JVM cannot detect.
+        RaftConfig cfg = RaftConfig.builder(3).voters(Set.of(9L, 1L, 4L, 3L, 7L)).build();
+
+        assertEquals(List.of(1L, 3L, 4L, 7L, 9L), List.copyOf(cfg.initialVoters()));
     }
 
     @Test

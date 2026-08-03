@@ -1,8 +1,10 @@
 package io.keel.raft;
 
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Static configuration for one node.
@@ -38,7 +40,12 @@ public record RaftConfig(
         if (nodeId <= 0) {
             throw new IllegalArgumentException("nodeId must be positive, got " + nodeId);
         }
-        initialVoters = Set.copyOf(initialVoters);
+        // Sorted, not just immutable. Set.copyOf returns a set whose iteration order is randomized
+        // per JVM by design, and the core iterates the voters to decide the order it sends vote
+        // requests and heartbeats in. That made a whole cluster's message ordering vary between JVM
+        // invocations, which is invisible to a determinism test that runs both replays in one JVM,
+        // and showed up as a simulation that reproduced locally but not on another JDK.
+        initialVoters = Collections.unmodifiableSet(new LinkedHashSet<>(new TreeSet<>(initialVoters)));
         if (!initialVoters.contains(nodeId)) {
             throw new IllegalArgumentException(
                     "initialVoters " + initialVoters + " must contain this node " + nodeId);

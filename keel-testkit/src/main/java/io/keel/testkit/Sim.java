@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.OptionalLong;
 import java.util.Random;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * A whole cluster in one thread, with a clock that only moves when asked.
@@ -80,7 +81,7 @@ public final class Sim {
         for (long id = 1; id <= config.nodes(); id++) {
             nodes.put(id, new Node(id));
         }
-        Set<Long> voters = new HashSet<>(nodes.keySet());
+        Set<Long> voters = new TreeSet<>(nodes.keySet());
         for (Node node : nodes.values()) {
             // A distinct derived seed per node, so two nodes do not pick identical election timeouts
             // for the whole run and split every vote.
@@ -260,7 +261,7 @@ public final class Sim {
         }
         node.raft =
                 RaftNode.restore(
-                        configFor(id, new HashSet<>(nodes.keySet())),
+                        configFor(id, new TreeSet<>(nodes.keySet())),
                         node.store,
                         new Random(config.seed() * 1_000_003L + id + tick));
         node.down = false;
