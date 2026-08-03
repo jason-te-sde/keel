@@ -1,6 +1,9 @@
 package io.keel.raft;
 
+import com.google.protobuf.InvalidProtocolBufferException;
 import io.keel.proto.log.Entry;
+import io.keel.proto.log.ConfChange;
+import io.keel.proto.log.ConfState;
 import io.keel.proto.log.HardState;
 import io.keel.proto.log.SnapshotMetadata;
 import java.util.ArrayDeque;
@@ -64,6 +67,16 @@ public final class RaftNode {
 
     /** Set when term, vote, or commit index changed and has not been persisted yet. */
     private boolean hardStateDirty;
+
+    /**
+     * Index of the newest configuration entry this leader has appended, or 0.
+     *
+     * <p>A second configuration change must not be appended while an earlier one is still
+     * unapplied. With one change in flight the old and new majorities always overlap, which is what
+     * makes single-node changes safe without a joint configuration; two in flight breaks that, and
+     * two disjoint majorities can elect two leaders in the same term.
+     */
+    private long pendingConfIndex;
 
     /**
      * Reads waiting for a heartbeat round to confirm this node is still the leader. Each carries the
@@ -250,6 +263,133 @@ public final class RaftNode {
     }
 
     /**
+     * Appends a membership change.
+     *
+     * <p>One voter at a time, which is a decision rather than a limitation: with a single change in
+     * flight the old and new majorities always overlap, so no joint configuration is needed (paper 4.3).
+     * Joint consensus handles arbitrary reconfiguration and roughly doubles the state every safety
+     * argument has to account for.
+     *
+     * <p>The change takes effect when the entry is <em>applied</em>, not when it is appended. A driver
+     * must call {@link #applyConfChange(ConfChange)} for every applied configuration entry, including
+     * ones it replays on startup, or the node will disagree with the cluster about who votes.
+     *
+     * @return the index the change was assigned
+     * @throws NotLeaderException if this node is not the leader
+     * @throws IllegalArgumentException if the change is a no-op, or would empty the cluster
+     * @throws IllegalStateException if an earlier configuration change has not been applied yet
+     */
+    public long proposeConfChange(ConfChange change) {
+        Objects.requireNonNull(change, "change");
+        if (role != Role.LEADER) {
+            throw new NotLeaderException(leaderId);
+        }
+        if (pendingConfIndex > log.applied()) {
+            throw new IllegalStateException(
+                    "a configuration change at index "
+                            + pendingConfIndex
+                            + " has not been applied yet (applied is "
+                            + log.applied()
+                            + ")");
+        }
+        validate(change);
+
+        long index = log.lastIndex() + 1;
+        log.append(List.of(Entries.confChange(index, term, change.toByteArray())));
+        pendingConfIndex = index;
+        LOG.info(
+                "node {} proposing to {} node {} at index {}",
+                cfg.nodeId(),
+                change.getType() == ConfChange.Type.TYPE_ADD_VOTER ? "add" : "remove",
+                change.getNodeId(),
+                index);
+        broadcastAppend();
+        return index;
+    }
+
+    private void validate(ConfChange change) {
+        boolean present = voters.contains(change.getNodeId());
+        switch (change.getType()) {
+            case TYPE_ADD_VOTER -> {
+                if (present) {
+                    throw new IllegalArgumentException("node " + change.getNodeId() + " is already a voter");
+                }
+            }
+            case TYPE_REMOVE_VOTER -> {
+                if (!present) {
+                    throw new IllegalArgumentException("node " + change.getNodeId() + " is not a voter");
+                }
+                if (voters.size() == 1) {
+                    throw new IllegalArgumentException("cannot remove the last voter");
+                }
+            }
+            case TYPE_UNSPECIFIED, UNRECOGNIZED ->
+                    throw new IllegalArgumentException("configuration change has no type");
+        }
+    }
+
+    /**
+     * Applies a membership change that has been committed and applied to the state machine.
+     *
+     * <p>Called by the driver for every applied configuration entry, replays included. The core cannot
+     * do it itself: it hands committed entries out and does not see when they are applied, and applying
+     * a change early would mean counting a vote from a node that is not a member yet.
+     *
+     * @return the membership after the change
+     */
+    public ConfState applyConfChange(ConfChange change) {
+        Objects.requireNonNull(change, "change");
+        switch (change.getType()) {
+            case TYPE_ADD_VOTER -> {
+                if (voters.add(change.getNodeId()) && role == Role.LEADER) {
+                    // Start from the end of the log rather than the beginning: a new voter that is
+                    // actually far behind will say so, and be rewound or sent a snapshot.
+                    peers.put(change.getNodeId(), new Progress(log.lastIndex() + 1));
+                }
+            }
+            case TYPE_REMOVE_VOTER -> {
+                voters.remove(change.getNodeId());
+                peers.remove(change.getNodeId());
+            }
+            case TYPE_UNSPECIFIED, UNRECOGNIZED ->
+                    throw new IllegalArgumentException("configuration change has no type");
+        }
+        LOG.info("node {} now sees voters {}", cfg.nodeId(), voters);
+
+        if (role == Role.LEADER && !voters.contains(cfg.nodeId())) {
+            // A leader that has removed itself has to stop leading, or the cluster has a leader that
+            // is not a member and cannot count its own vote toward anything.
+            LOG.info("node {} removed itself from the cluster; stepping down", cfg.nodeId());
+            becomeFollower(term, NO_NODE);
+        } else if (role == Role.LEADER) {
+            // The quorum may have shrunk, which can make an already-stored entry committable.
+            maybeCommit();
+        }
+        return confState();
+    }
+
+    /** The current membership, for a snapshot's metadata. */
+    public ConfState confState() {
+        return ConfState.newBuilder().addAllVoters(voters).build();
+    }
+
+    /**
+     * Adopts the membership recorded in a snapshot.
+     *
+     * <p>A node restoring from a snapshot cannot recover this from the log, because the entries that
+     * would have carried the changes are exactly what the snapshot replaced.
+     */
+    private void adoptConfState(ConfState state) {
+        if (state.getVotersCount() == 0) {
+            return;
+        }
+        voters.clear();
+        voters.addAll(state.getVotersList());
+        peers.keySet().retainAll(voters);
+        LOG.info("node {} adopted voters {} from a snapshot", cfg.nodeId(), voters);
+    }
+
+    /**
      * Asks for an index that can be read at without violating linearizability.
      *
      * <p>This is ReadIndex, paper section 6.4. Reading a leader's local state without it is not
@@ -399,6 +539,16 @@ public final class RaftNode {
                 voters);
     }
 
+    /** Decodes a configuration change from an entry's payload. */
+    public static ConfChange decodeConfChange(Entry entry) {
+        try {
+            return ConfChange.parseFrom(entry.getData());
+        } catch (InvalidProtocolBufferException e) {
+            throw new IllegalArgumentException(
+                    "entry at index " + entry.getIndex() + " is not a configuration change", e);
+        }
+    }
+
     /** Term at {@code index}, for invariant checks that compare logs across nodes. */
     public long termAt(long index) {
         return log.term(index);
@@ -480,6 +630,7 @@ public final class RaftNode {
         peers.clear();
         ballots.clear();
         abandonReads();
+        pendingConfIndex = 0;
     }
 
     private void becomePreCandidate() {
@@ -521,6 +672,10 @@ public final class RaftNode {
                 peers.put(v, new Progress(nextIndex));
             }
         }
+
+        // Any configuration entry from a previous leader is either applied or will be; this leader
+        // starts with none of its own outstanding.
+        pendingConfIndex = 0;
 
         // Commit an entry in this term before doing anything else. The commit rule (5.4.2) will not
         // let a new leader advance the commit index over entries from previous terms until one of
@@ -862,6 +1017,7 @@ public final class RaftNode {
             return;
         }
         log.restore(meta);
+        adoptConfState(meta.getConf());
         hardStateDirty = true;
         send(
                 new RaftMessage.InstallSnapshotReply(

@@ -106,6 +106,22 @@ message StatusResponse {
   uint64 keys = 10;
 }
 
+message AddMemberRequest {
+  uint64 node_id = 1;
+  // Where to reach it. Carried in the configuration entry so every node learns the
+  // address from the log rather than from separate configuration.
+  string address = 2;
+}
+
+message RemoveMemberRequest {
+  uint64 node_id = 1;
+}
+
+message MemberChangeResponse {
+  ResponseHeader header = 1;
+  repeated uint64 voters = 2;
+}
+
 service KvService {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);
@@ -113,4 +129,7 @@ service KvService {
   rpc CompareAndSwap(CasRequest) returns (CasResponse);
   rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
   rpc Status(StatusRequest) returns (StatusResponse);
+  // One voter at a time. A second change while the first is unapplied is refused.
+  rpc AddMember(AddMemberRequest) returns (MemberChangeResponse);
+  rpc RemoveMember(RemoveMemberRequest) returns (MemberChangeResponse);
 }

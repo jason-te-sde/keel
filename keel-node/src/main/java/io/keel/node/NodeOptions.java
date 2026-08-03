@@ -11,7 +11,12 @@ import java.util.TreeMap;
  * How to run one node.
  *
  * @param nodeId this node's id, which must match its entry in {@code cluster}
- * @param cluster every voter, including this node, mapped to {@code host:port}
+ * @param cluster the address book: every node this one may need to reach, including itself, mapped to
+ *     {@code host:port}. Addresses of nodes added later arrive in the configuration entries themselves.
+ * @param bootstrapVoters the membership to start from, which is <em>not</em> the same thing as the
+ *     address book. A node joining an existing cluster knows everyone's address but is not a member
+ *     yet, and must not count itself in a quorum until the entry adding it is applied. Empty means
+ *     every node in the address book is a voter, which is how a fresh cluster starts.
  * @param dataDir where the log lives; one directory per node
  * @param tick wall-clock duration of one logical tick. The core counts ticks and never reads a clock,
  *     so this is the only place real time enters the system.
@@ -26,6 +31,7 @@ import java.util.TreeMap;
 public record NodeOptions(
         long nodeId,
         Map<Long, String> cluster,
+        Set<Long> bootstrapVoters,
         Path dataDir,
         Duration tick,
         int electionTimeoutTicks,
@@ -38,8 +44,12 @@ public record NodeOptions(
         cluster = new LinkedHashMap<>(new TreeMap<>(cluster));
         if (!cluster.containsKey(nodeId)) {
             throw new IllegalArgumentException(
-                    "cluster " + cluster.keySet() + " does not contain this node " + nodeId);
+                    "the address book " + cluster.keySet() + " has no address for this node " + nodeId);
         }
+        bootstrapVoters =
+                bootstrapVoters == null || bootstrapVoters.isEmpty()
+                        ? Set.copyOf(cluster.keySet())
+                        : Set.copyOf(bootstrapVoters);
         if (tick.isZero() || tick.isNegative()) {
             throw new IllegalArgumentException("tick must be positive");
         }
@@ -61,6 +71,27 @@ public record NodeOptions(
         return new NodeOptions(
                 nodeId,
                 cluster,
+                Set.of(),
+                dataDir,
+                Duration.ofMillis(50),
+                10,
+                1,
+                Duration.ofSeconds(5),
+                null,
+                8192);
+    }
+
+    /**
+     * Options for a node joining an existing cluster: it knows every address but is not a voter yet.
+     *
+     * @param existingVoters the cluster's current membership, which does not include this node
+     */
+    public static NodeOptions joining(
+            long nodeId, Map<Long, String> addressBook, Set<Long> existingVoters, Path dataDir) {
+        return new NodeOptions(
+                nodeId,
+                addressBook,
+                existingVoters,
                 dataDir,
                 Duration.ofMillis(50),
                 10,
@@ -72,30 +103,30 @@ public record NodeOptions(
 
     public NodeOptions withTick(Duration tick) {
         return new NodeOptions(
-                nodeId, cluster, dataDir, tick, electionTimeoutTicks, heartbeatTicks, requestTimeout,
-                stateMachineDir, snapshotThresholdEntries);
+                nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
+                requestTimeout, stateMachineDir, snapshotThresholdEntries);
     }
 
     public NodeOptions withRequestTimeout(Duration timeout) {
         return new NodeOptions(
-                nodeId, cluster, dataDir, tick, electionTimeoutTicks, heartbeatTicks, timeout,
+                nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks, timeout,
                 stateMachineDir, snapshotThresholdEntries);
     }
 
     public NodeOptions withRocksDb(Path directory) {
         return new NodeOptions(
-                nodeId, cluster, dataDir, tick, electionTimeoutTicks, heartbeatTicks, requestTimeout,
-                directory, snapshotThresholdEntries);
+                nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
+                requestTimeout, directory, snapshotThresholdEntries);
     }
 
     public NodeOptions withSnapshotThreshold(int entries) {
         return new NodeOptions(
-                nodeId, cluster, dataDir, tick, electionTimeoutTicks, heartbeatTicks, requestTimeout,
-                stateMachineDir, entries);
+                nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
+                requestTimeout, stateMachineDir, entries);
     }
 
     public Set<Long> voters() {
-        return cluster.keySet();
+        return bootstrapVoters;
     }
 
     /** Port this node listens on, parsed from its own cluster entry. */

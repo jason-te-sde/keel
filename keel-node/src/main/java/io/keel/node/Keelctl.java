@@ -66,6 +66,7 @@ public final class Keelctl {
                 case "del" -> delete(client, positional, out, err);
                 case "cas" -> compareAndSwap(client, positional, out, err);
                 case "status" -> status(client, cluster, out);
+                case "member" -> member(client, positional, out, err);
                 default -> {
                     err.println("unknown command: " + command);
                     usage(err);
@@ -132,6 +133,40 @@ public final class Keelctl {
         return applied ? 0 : 1;
     }
 
+    private static int member(
+            KeelClient client, List<String> positional, PrintStream out, PrintStream err) {
+        if (positional.size() < 3) {
+            err.println("usage: keelctl --cluster=... member add ID=HOST:PORT | member remove ID");
+            return 2;
+        }
+        String action = positional.get(1);
+        String argument = positional.get(2);
+        switch (action) {
+            case "add" -> {
+                int equals = argument.indexOf('=');
+                if (equals < 0) {
+                    err.println("usage: keelctl --cluster=... member add ID=HOST:PORT");
+                    return 2;
+                }
+                List<Long> voters =
+                        client.addMember(
+                                Long.parseLong(argument.substring(0, equals).trim()),
+                                argument.substring(equals + 1).trim());
+                out.println("voters: " + voters);
+                return 0;
+            }
+            case "remove" -> {
+                List<Long> voters = client.removeMember(Long.parseLong(argument.trim()));
+                out.println("voters: " + voters);
+                return 0;
+            }
+            default -> {
+                err.println("unknown member action: " + action);
+                return 2;
+            }
+        }
+    }
+
     private static int status(KeelClient client, Map<Long, String> cluster, PrintStream out) {
         for (long id : cluster.keySet()) {
             try {
@@ -175,6 +210,8 @@ public final class Keelctl {
                   cas KEY EXPECTED|- VALUE     write only if the current value matches
                                                ('-' means the key must be absent)
                   status                       per-node role, term, and progress
+                  member add ID=HOST:PORT      add a voter
+                  member remove ID             remove a voter
 
                 exit status is 1 when a key is absent or a compare-and-swap is rejected.
                 """);

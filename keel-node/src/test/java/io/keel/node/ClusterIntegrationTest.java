@@ -1,6 +1,7 @@
 package io.keel.node;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -18,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
@@ -133,16 +135,7 @@ class ClusterIntegrationTest {
 
         KeelNode restarted =
                 KeelNode.open(
-                                new NodeOptions(
-                                        victim,
-                                        cluster,
-                                        dataDir,
-                                        TICK,
-                                        10,
-                                        1,
-                                        Duration.ofSeconds(5),
-                                        null,
-                                        SNAPSHOT_EVERY))
+                                optionsFor(victim, dataDir))
                         .start();
         nodes.add(restarted);
 
@@ -171,16 +164,7 @@ class ClusterIntegrationTest {
 
         KeelNode restarted =
                 KeelNode.open(
-                                new NodeOptions(
-                                        victim,
-                                        cluster,
-                                        dataDir,
-                                        TICK,
-                                        10,
-                                        1,
-                                        Duration.ofSeconds(5),
-                                        null,
-                                        SNAPSHOT_EVERY))
+                                optionsFor(victim, dataDir))
                         .start();
         nodes.add(restarted);
 
@@ -208,16 +192,7 @@ class ClusterIntegrationTest {
 
         KeelNode restarted =
                 KeelNode.open(
-                                new NodeOptions(
-                                        victim,
-                                        cluster,
-                                        dataDir,
-                                        TICK,
-                                        10,
-                                        1,
-                                        Duration.ofSeconds(5),
-                                        null,
-                                        SNAPSHOT_EVERY))
+                                optionsFor(victim, dataDir))
                         .start();
         nodes.add(restarted);
 
@@ -252,16 +227,7 @@ class ClusterIntegrationTest {
         for (long id : cluster.keySet()) {
             nodes.add(
                     KeelNode.open(
-                                    new NodeOptions(
-                                            id,
-                                            cluster,
-                                            dataDirs.get(i++),
-                                            TICK,
-                                            10,
-                                            1,
-                                            Duration.ofSeconds(5),
-                                            null,
-                                            SNAPSHOT_EVERY))
+                                    optionsFor(id, dataDirs.get(i++)))
                             .start());
         }
 
@@ -342,6 +308,57 @@ class ClusterIntegrationTest {
     }
 
     @Test
+    @DisplayName("a fourth node joins a running cluster and serves reads")
+    void addAMemberToARunningCluster() {
+        startCluster(3);
+        KeelClient client = client();
+        client.openSession();
+        for (int i = 0; i < 20; i++) {
+            client.put("k" + i, "v" + i);
+        }
+
+        // A node that is not a voter yet: it runs with the cluster's current membership, accepts
+        // entries, and does not campaign.
+        long newId = 4;
+        int port = freePorts(1).get(0);
+        String address = "127.0.0.1:" + port;
+        Map<Long, String> withNewNode = new LinkedHashMap<>(cluster);
+        withNewNode.put(newId, address);
+        KeelNode joining =
+                KeelNode.open(
+                                joiningOptions(newId, withNewNode, dataDirOf(newId)))
+                        .start();
+        nodes.add(joining);
+
+        List<Long> voters = client.addMember(newId, address);
+
+        assertTrue(voters.contains(newId), "the change should report the new membership: " + voters);
+        await(() -> joining.keyCount() == 20, "the new voter to catch up");
+        // The address travelled in the configuration entry, so the existing nodes could reach it
+        // without their own configuration being touched.
+        assertEquals(20, joining.keyCount());
+        assertEquals(Optional.of("v7"), client.get("k7"));
+    }
+
+    @Test
+    @DisplayName("a removed node stops being part of the quorum")
+    void removeAMember() {
+        startCluster(3);
+        KeelClient client = client();
+        client.openSession();
+        client.put("before", "removal");
+        long victim = followerId();
+
+        List<Long> voters = client.removeMember(victim);
+        assertFalse(voters.contains(victim), "membership should no longer include it: " + voters);
+
+        // Two voters remain, so a quorum is two. Stopping the removed node must not stop writes.
+        stop(victim);
+        client.put("after", "removal");
+        assertEquals(Optional.of("removal"), client.get("after"));
+    }
+
+    @Test
     @DisplayName("every keelctl command works against a live cluster")
     void keelctlCommands() {
         startCluster(3);
@@ -367,6 +384,11 @@ class ClusterIntegrationTest {
         assertEquals(0, ctl(clusterFlag, "del", "cli-key").exitCode());
         assertEquals(1, ctl(clusterFlag, "get", "cli-key").exitCode());
 
+        Captured member = ctl(clusterFlag, "member", "remove", String.valueOf(followerId()));
+        assertEquals(0, member.exitCode(), member.out() + member.err());
+        assertTrue(member.out().contains("voters:"), member.out());
+        assertEquals(2, ctl(clusterFlag, "member", "sideways", "1").exitCode());
+
         assertEquals(0, ctl("--help").exitCode());
         assertEquals(2, ctl(clusterFlag, "nonsense").exitCode(), "an unknown command is a usage error");
         assertEquals(2, ctl("get", "k").exitCode(), "no cluster flag is a usage error");
@@ -381,20 +403,30 @@ class ClusterIntegrationTest {
             cluster.put((long) (i + 1), "127.0.0.1:" + ports.get(i));
         }
         for (long id : cluster.keySet()) {
-            NodeOptions options =
-                    new NodeOptions(
-                            id,
-                            cluster,
-                            dataDirOf(id),
-                            TICK,
-                            10,
-                            1,
-                            Duration.ofSeconds(5),
-                            null,
-                            SNAPSHOT_EVERY);
+            NodeOptions options = optionsFor(id, dataDirOf(id));
             nodes.add(KeelNode.open(options).start());
         }
         await(() -> leaderIdOrZero() != 0, "the cluster to elect a leader");
+    }
+
+    private NodeOptions optionsFor(long id, Path dataDir) {
+        return new NodeOptions(
+                id, cluster, Set.of(), dataDir, TICK, 10, 1, Duration.ofSeconds(5), null, SNAPSHOT_EVERY);
+    }
+
+    /** Options for a node that knows every address but is not a voter yet. */
+    private NodeOptions joiningOptions(long id, Map<Long, String> addressBook, Path dataDir) {
+        return new NodeOptions(
+                id,
+                addressBook,
+                cluster.keySet(),
+                dataDir,
+                TICK,
+                10,
+                1,
+                Duration.ofSeconds(5),
+                null,
+                SNAPSHOT_EVERY);
     }
 
     private Path dataDirOf(long id) {
