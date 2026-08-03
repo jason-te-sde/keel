@@ -25,6 +25,7 @@
 
   <modules>
     <module>keel-proto</module>
+    <module>keel-raft</module>
   </modules>
 
   <properties>
@@ -99,6 +100,11 @@
       <dependency>
         <groupId>io.keel</groupId>
         <artifactId>keel-proto</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.keel</groupId>
+        <artifactId>keel-raft</artifactId>
         <version>${project.version}</version>
       </dependency>
     </dependencies>
