@@ -1,6 +1,7 @@
 package io.keel.raft;
 
 import io.keel.proto.log.Entry;
+import io.keel.proto.log.SnapshotMetadata;
 import java.util.List;
 
 /**
@@ -42,6 +43,16 @@ public interface RaftStorage {
      * @throws CompactedException if {@code lo} is below {@link #firstIndex()}
      */
     List<Entry> entries(long lo, long hi, long maxBytes);
+
+    /**
+     * The snapshot the log has been compacted to, or a zeroed message when nothing has been
+     * compacted.
+     *
+     * <p>The core needs this for one specific reason: after compaction, the entry just below
+     * {@link #firstIndex()} is gone, but its term is still needed to send the next AppendEntries and
+     * to answer a vote. The snapshot boundary is where that term comes from.
+     */
+    SnapshotMetadata snapshotMetadata();
 
     /** Thrown when a caller asks for log data that has been discarded by compaction. */
     final class CompactedException extends RuntimeException {

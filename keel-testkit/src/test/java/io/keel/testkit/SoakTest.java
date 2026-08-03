@@ -34,6 +34,7 @@ class SoakTest {
         long totalTicks = 0;
         long totalChecks = 0;
         long committed = 0;
+        long snapshots = 0;
 
         for (int seed = 1; seed <= seeds; seed++) {
             // Alternate profiles: chaotic makes progress often enough to build long logs, brutal
@@ -61,20 +62,24 @@ class SoakTest {
             Sim.SimStats stats = sim.stats();
             totalTicks += stats.ticks();
             totalChecks += stats.invariantChecks();
+            snapshots += stats.snapshotsTaken();
             committed += sim.views().stream().mapToLong(NodeView::commitIndex).max().orElse(0);
         }
 
         double seconds = (System.nanoTime() - start) / 1e9;
         System.out.printf(
                 Locale.ROOT,
-                "soak: %d seeds, %,d ticks, %,d invariant checks in %.1fs (%,.0f ticks/s)%n",
+                "soak: %d seeds, %,d ticks, %,d invariant checks, %,d snapshots in %.1fs (%,.0f ticks/s)%n",
                 seeds,
                 totalTicks,
                 totalChecks,
+                snapshots,
                 seconds,
                 totalTicks / seconds);
 
         // A sweep where nothing ever committed would pass every safety check for the wrong reason.
         assertTrue(committed > 0, "no seed in the sweep committed anything");
+        // A sweep where nothing ever compacted would leave the snapshot paths untested.
+        assertTrue(snapshots > 0, "no seed in the sweep took a snapshot");
     }
 }

@@ -1,6 +1,7 @@
 package io.keel.raft;
 
 import io.keel.proto.log.Entry;
+import io.keel.proto.log.SnapshotMetadata;
 import java.util.List;
 
 /**
@@ -142,6 +143,32 @@ public sealed interface RaftMessage {
         @Override
         public RaftMessage withTo(long to) {
             return new ReadIndexRequest(from, to, term, requestId);
+        }
+    }
+
+    /**
+     * Tells a follower to catch up from a snapshot instead of from entries.
+     *
+     * <p>Carries only the metadata. Moving the payload is the driver's job, because a snapshot is
+     * arbitrarily large and the core has no I/O: it decides <em>when</em> a snapshot is needed and
+     * <em>which boundary</em> it establishes, and nothing more. A driver must have the payload durable
+     * before it steps this message into the receiving core.
+     */
+    record InstallSnapshot(long from, long to, long term, SnapshotMetadata meta)
+            implements RaftMessage {
+        @Override
+        public RaftMessage withTo(long to) {
+            return new InstallSnapshot(from, to, term, meta);
+        }
+    }
+
+    /** Response to {@link InstallSnapshot}. */
+    record InstallSnapshotReply(
+            long from, long to, long term, boolean success, long matchIndex)
+            implements RaftMessage {
+        @Override
+        public RaftMessage withTo(long to) {
+            return new InstallSnapshotReply(from, to, term, success, matchIndex);
         }
     }
 

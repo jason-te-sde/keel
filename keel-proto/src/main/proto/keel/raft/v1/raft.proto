@@ -108,8 +108,37 @@ message RaftEnvelope {
 
 message SendAck {}
 
+// One chunk of a state machine snapshot.
+//
+// Streamed rather than sent whole because a snapshot is arbitrarily large and must
+// not be buffered entirely on either side. This is the one place the transport is
+// not a simple message relay: the payload is bulk data the consensus core never
+// sees, and the core's InstallSnapshot message carries only the boundary it
+// establishes.
+message InstallSnapshotChunk {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  keel.log.v1.SnapshotMetadata meta = 3;
+  uint64 offset = 4;
+  bytes data = 5;
+  bool last = 6;
+}
+
+// Sent once the payload is durable and installed, which is why it is the stream's
+// return value rather than another envelope: the leader must not learn that a
+// follower holds a snapshot before the follower actually holds it.
+message InstallSnapshotAck {
+  uint64 term = 1;
+  uint64 follower_id = 2;
+  bool success = 3;
+  uint64 match_index = 4;
+}
+
 service RaftService {
   // Delivers one message. The acknowledgement means "received", never "agreed":
   // consensus decisions travel as further messages.
   rpc Send(RaftEnvelope) returns (SendAck);
+
+  // Transfers a snapshot payload. The response means installed, not merely received.
+  rpc InstallSnapshot(stream InstallSnapshotChunk) returns (InstallSnapshotAck);
 }

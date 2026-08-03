@@ -231,6 +231,108 @@ class SegmentedLogTest {
         }
     }
 
+    @Nested
+    @DisplayName("compaction")
+    class Compaction {
+
+        @Test
+        @DisplayName("survives a reopen, and the boundary term with it")
+        void compactionIsDurable() {
+            try (SegmentedLog log = open()) {
+                log.append(entries(1, 1, 2, 2, 3));
+                log.sync();
+                log.compact(boundary(3, 2));
+                assertEquals(4, log.firstIndex());
+            }
+
+            try (SegmentedLog log = open()) {
+                assertEquals(4, log.firstIndex(), "the compaction marker has to survive");
+                assertEquals(5, log.lastIndex());
+                // The next AppendEntries to a follower needs prevLogTerm at the boundary.
+                assertEquals(2, log.term(3));
+                assertEquals(3, log.term(5));
+                assertThrows(RaftStorage.CompactedException.class, () -> log.term(2));
+                assertEquals(3, log.snapshotMetadata().getLastIndex());
+            }
+        }
+
+        @Test
+        @DisplayName("frees whole segments once nothing points into them")
+        void compactionDeletesSegments() {
+            try (SegmentedLog log = openWithSegmentBytes(128)) {
+                for (int i = 1; i <= 40; i++) {
+                    log.append(List.of(Entries.normal(i, 1, ("v" + i).getBytes(StandardCharsets.UTF_8))));
+                }
+                log.sync();
+                int before = log.segmentCount();
+                assertTrue(before > 3, "expected several segments, got " + before);
+
+                log.compact(boundary(30, 1));
+
+                assertTrue(
+                        log.segmentCount() < before,
+                        "compaction should have freed segments: " + before + " -> " + log.segmentCount());
+                assertEquals(10, log.entries(31, 41, Long.MAX_VALUE).size());
+            }
+        }
+
+        @Test
+        @DisplayName("installing a snapshot discards the whole log, not just the prefix")
+        void installDiscardsEverything() {
+            // A follower catching up may hold entries above the boundary that came from a leader that
+            // lost, so they are not known to be valid either.
+            try (SegmentedLog log = open()) {
+                log.append(entries(1, 1, 1, 1));
+                log.sync();
+                log.installSnapshot(boundary(10, 4));
+
+                assertEquals(11, log.firstIndex());
+                assertEquals(10, log.lastIndex());
+                assertEquals(4, log.term(10));
+            }
+
+            try (SegmentedLog log = open()) {
+                assertEquals(11, log.firstIndex(), "and it survives a reopen");
+                assertEquals(10, log.lastIndex());
+                assertEquals(4, log.snapshotMetadata().getLastTerm());
+            }
+        }
+
+        @Test
+        @DisplayName("entries appended after a snapshot are kept on replay")
+        void entriesAfterASnapshotSurvive() {
+            try (SegmentedLog log = open()) {
+                log.installSnapshot(boundary(10, 4));
+                log.append(entriesFrom(11, 5, 5));
+                log.sync();
+            }
+
+            try (SegmentedLog log = open()) {
+                assertEquals(11, log.firstIndex());
+                assertEquals(12, log.lastIndex());
+                assertEquals(5, log.term(12));
+            }
+        }
+
+        @Test
+        @DisplayName("compacting backwards is refused")
+        void compactingBackwardsIsRefused() {
+            try (SegmentedLog log = open()) {
+                log.append(entries(1, 1, 1, 1));
+                log.compact(boundary(3, 1));
+
+                assertThrows(IllegalArgumentException.class, () -> log.compact(boundary(2, 1)));
+            }
+        }
+
+        private io.keel.proto.log.SnapshotMetadata boundary(long index, long term) {
+            return io.keel.proto.log.SnapshotMetadata.newBuilder()
+                    .setLastIndex(index)
+                    .setLastTerm(term)
+                    .build();
+        }
+    }
+
     @Test
     @DisplayName("a gap is refused")
     void gapIsRefused() {

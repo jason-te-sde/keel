@@ -20,6 +20,8 @@ import java.util.TreeMap;
  * @param requestTimeout how long a client request waits before being reported as timed out
  * @param stateMachineDir when present, keep state in RocksDB under this directory instead of on the
  *     heap
+ * @param snapshotThresholdEntries take a snapshot and compact the log once this many entries have
+ *     accumulated beyond the last snapshot; 0 disables compaction
  */
 public record NodeOptions(
         long nodeId,
@@ -29,7 +31,8 @@ public record NodeOptions(
         int electionTimeoutTicks,
         int heartbeatTicks,
         Duration requestTimeout,
-        Path stateMachineDir) {
+        Path stateMachineDir,
+        int snapshotThresholdEntries) {
 
     public NodeOptions {
         cluster = new LinkedHashMap<>(new TreeMap<>(cluster));
@@ -43,6 +46,9 @@ public record NodeOptions(
         if (electionTimeoutTicks <= heartbeatTicks) {
             throw new IllegalArgumentException(
                     "electionTimeoutTicks must exceed heartbeatTicks");
+        }
+        if (snapshotThresholdEntries < 0) {
+            throw new IllegalArgumentException("snapshotThresholdEntries cannot be negative");
         }
     }
 
@@ -60,22 +66,32 @@ public record NodeOptions(
                 10,
                 1,
                 Duration.ofSeconds(5),
-                null);
+                null,
+                8192);
     }
 
     public NodeOptions withTick(Duration tick) {
         return new NodeOptions(
-                nodeId, cluster, dataDir, tick, electionTimeoutTicks, heartbeatTicks, requestTimeout, stateMachineDir);
+                nodeId, cluster, dataDir, tick, electionTimeoutTicks, heartbeatTicks, requestTimeout,
+                stateMachineDir, snapshotThresholdEntries);
     }
 
     public NodeOptions withRequestTimeout(Duration timeout) {
         return new NodeOptions(
-                nodeId, cluster, dataDir, tick, electionTimeoutTicks, heartbeatTicks, timeout, stateMachineDir);
+                nodeId, cluster, dataDir, tick, electionTimeoutTicks, heartbeatTicks, timeout,
+                stateMachineDir, snapshotThresholdEntries);
     }
 
     public NodeOptions withRocksDb(Path directory) {
         return new NodeOptions(
-                nodeId, cluster, dataDir, tick, electionTimeoutTicks, heartbeatTicks, requestTimeout, directory);
+                nodeId, cluster, dataDir, tick, electionTimeoutTicks, heartbeatTicks, requestTimeout,
+                directory, snapshotThresholdEntries);
+    }
+
+    public NodeOptions withSnapshotThreshold(int entries) {
+        return new NodeOptions(
+                nodeId, cluster, dataDir, tick, electionTimeoutTicks, heartbeatTicks, requestTimeout,
+                stateMachineDir, entries);
     }
 
     public Set<Long> voters() {

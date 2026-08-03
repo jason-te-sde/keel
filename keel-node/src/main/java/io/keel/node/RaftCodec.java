@@ -80,6 +80,16 @@ final class RaftCodec {
                                     .setTerm(r.term())
                                     .setFollowerId(r.from())
                                     .setRequestId(r.requestId()));
+            case RaftMessage.InstallSnapshot ignored ->
+                    // Snapshots do not travel as envelopes. The payload is bulk data on its own
+                    // streaming RPC, and KeelNode intercepts this message to start that stream.
+                    throw new IllegalArgumentException(
+                            "InstallSnapshot is carried by the streaming RPC, not by Send");
+            case RaftMessage.InstallSnapshotReply ignored ->
+                    // The reply is the stream's return value, so that the leader cannot learn a
+                    // follower holds a snapshot before the follower actually holds it.
+                    throw new IllegalArgumentException(
+                            "InstallSnapshotReply is the streaming RPC's response, not a Send");
             case RaftMessage.ReadIndexReply r ->
                     envelope.setReadIndexResponse(
                             ReadIndexResponse.newBuilder()
