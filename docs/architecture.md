@@ -128,12 +128,55 @@ the cost of latency and a queue; the lock is the trade, and the code says so.
 A follower serving its own read is still linearizable, because the index came from a
 leader that confirmed itself. That is what keeps reads off the leader.
 
+## Snapshots
+
+The state machine is serialized, the log prefix discarded, and a follower that has
+fallen past the leader's oldest retained entry caught up from the snapshot instead.
+
+The core's part is narrow: it decides *when* a follower needs a snapshot and *which
+boundary* it establishes. It never moves bytes, because it has no I/O. So
+`RaftMessage.InstallSnapshot` carries metadata only, and the transport streams the
+payload on its own RPC whose **response means installed, not received**. A leader must
+not learn a follower holds a snapshot before the follower holds it.
+
+Three orderings carry the safety here, and each can lose committed data if reversed:
+
+1. The state machine snapshot is written and fsynced **before** the log is compacted.
+   Compaction is the point of no return.
+2. A received snapshot is durable and checksum-verified **before** the core is told.
+3. A snapshot in a `Ready` batch is installed **before** that batch's entries are
+   appended, because those entries sit above its boundary.
+
+Startup refuses to run if the log claims a boundary that no snapshot covers. The
+entries below it are gone and so is their effect; continuing would hide data loss.
+
+## Membership changes
+
+One voter at a time. With a single change in flight the old and new majorities always
+overlap, so no joint configuration is needed.
+
+Four rules:
+
+- A change takes effect when the entry is **applied**, not when it is appended.
+  Applying early would mean counting a vote from a node that is not a member yet.
+- A leader will not append a second change while the first is unapplied. Two in flight
+  can produce two disjoint majorities, and therefore two leaders in one term.
+- A leader removed from the configuration steps down. It cannot lead a cluster it is
+  not in, because it cannot count its own vote toward anything.
+- Membership travels in snapshots, because a node restoring from one cannot recover the
+  configuration from the log: the entries that carried it are what the snapshot
+  replaced.
+
+A joining node starts as a **non-voter**: it accepts entries, does not campaign, and is
+not counted in any quorum until the entry adding it is applied. That is why the node
+layer keeps the address book and the voter set separate — a joining node knows where
+everyone is and is a member of nothing. Addresses travel inside the configuration
+entries, so membership comes from the log and nowhere else.
+
 ## What is deliberately not here
 
-- **No snapshots**, so no compaction and no `InstallSnapshot`. The core throws if a
-  follower needs an entry that has been discarded, which cannot happen while nothing
-  discards anything.
-- **No membership changes.** `RaftConfig` fixes the voters, and the core has a
-  `promotable()` check ready for the node that is not a voter.
-- **No joint consensus**, ever: the plan is single-node changes, and
-  `docs/design/0004-scope.md` explains why.
+- **No joint consensus**, ever. Single-node changes make it unnecessary; see
+  `docs/design/0004-scope.md`.
+- **No leader leases.** They would let a leader skip the ReadIndex quorum round for a
+  bounded window, at the cost of a clock assumption the core does not currently make.
+- **No learners**, no leader transfer, no TLS, no multi-raft.
