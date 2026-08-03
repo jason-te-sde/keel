@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package keel.service.v1;
+
+import "keel/kv/v1/kv.proto";
+
+option java_package = "io.keel.proto.service";
+option java_outer_classname = "ServiceProto";
+option java_multiple_files = true;
+
+// The client-facing API.
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_OK = 1;
+  // This node is not the leader. leader_hint names who it believed was, so a
+  // client can retry without rediscovering the cluster from scratch.
+  ERROR_CODE_NOT_LEADER = 2;
+  // No leader is known, or one could not confirm itself within the deadline.
+  // Distinct from NOT_LEADER because there is nowhere better to retry.
+  ERROR_CODE_NO_LEADER = 3;
+  // The request could not be confirmed in time. It may or may not have applied,
+  // which is exactly why a client should be using a session.
+  ERROR_CODE_TIMEOUT = 4;
+  ERROR_CODE_SESSION_EXPIRED = 5;
+  ERROR_CODE_INVALID = 6;
+}
+
+message ResponseHeader {
+  ErrorCode code = 1;
+  uint64 leader_hint = 2;
+  string message = 3;
+}
+
+message GetRequest {
+  bytes key = 1;
+  // When false, read whatever this replica currently holds. Faster, and not
+  // linearizable: a replica can be arbitrarily far behind.
+  bool linearizable = 2;
+}
+
+message GetResponse {
+  ResponseHeader header = 1;
+  bool found = 2;
+  bytes value = 3;
+  // Index the value was read at, so a caller can reason about what it observed.
+  uint64 read_index = 4;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  keel.kv.v1.Session session = 3;
+}
+
+message PutResponse {
+  ResponseHeader header = 1;
+  uint64 index = 2;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+  keel.kv.v1.Session session = 2;
+}
+
+message DeleteResponse {
+  ResponseHeader header = 1;
+  bool found = 2;
+}
+
+message CasRequest {
+  bytes key = 1;
+  bytes expected = 2;
+  bool expect_absent = 3;
+  bytes value = 4;
+  keel.kv.v1.Session session = 5;
+}
+
+message CasResponse {
+  ResponseHeader header = 1;
+  bool applied = 2;
+  // Current value when the precondition failed, so a caller can retry knowingly.
+  bool found = 3;
+  bytes value = 4;
+}
+
+message RegisterClientRequest {}
+
+message RegisterClientResponse {
+  ResponseHeader header = 1;
+  uint64 client_id = 2;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  ResponseHeader header = 1;
+  uint64 node_id = 2;
+  string role = 3;
+  uint64 term = 4;
+  uint64 leader_id = 5;
+  uint64 commit_index = 6;
+  uint64 applied_index = 7;
+  uint64 last_index = 8;
+  repeated uint64 voters = 9;
+  uint64 keys = 10;
+}
+
+service KvService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc CompareAndSwap(CasRequest) returns (CasResponse);
+  rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}

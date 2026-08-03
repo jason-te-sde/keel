@@ -29,6 +29,7 @@
     <module>keel-storage</module>
     <module>keel-kv</module>
     <module>keel-testkit</module>
+    <module>keel-node</module>
   </modules>
 
   <properties>
@@ -139,6 +140,10 @@
           <artifactId>maven-compiler-plugin</artifactId>
           <version>${compiler.plugin.version}</version>
           <configuration>
+            <!-- No module uses an annotation processor. Saying so explicitly stops the compiler
+                 warning that nothing claimed the annotations it found on the classpath, which
+                 arrives as soon as a dependency happens to ship a processor. -->
+            <proc>none</proc>
             <compilerArgs>
               <!-- Warnings are build failures. Two lint categories are off on
                    purpose: 'serial' fires on exception classes that are never

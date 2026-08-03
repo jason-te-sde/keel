@@ -1,0 +1,236 @@
+package io.keel.node;
+
+import com.google.protobuf.ByteString;
+import io.grpc.ManagedChannel;
+import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
+import io.keel.proto.kv.Session;
+import io.keel.proto.service.CasRequest;
+import io.keel.proto.service.CasResponse;
+import io.keel.proto.service.DeleteRequest;
+import io.keel.proto.service.ErrorCode;
+import io.keel.proto.service.GetRequest;
+import io.keel.proto.service.GetResponse;
+import io.keel.proto.service.KvServiceGrpc;
+import io.keel.proto.service.PutRequest;
+import io.keel.proto.service.RegisterClientRequest;
+import io.keel.proto.service.RegisterClientResponse;
+import io.keel.proto.service.ResponseHeader;
+import io.keel.proto.service.StatusRequest;
+import io.keel.proto.service.StatusResponse;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * A client that finds the leader and keeps its writes exactly-once.
+ *
+ * <p>Two things it does that a naive client does not. It follows the leader hint on a rejection
+ * instead of rediscovering the cluster, and it opens a session and numbers its requests, so a retry
+ * after a timeout is deduplicated by the state machine rather than applied twice. Without the session
+ * a retried compare-and-swap is a different outcome, and the client cannot tell the difference.
+ *
+ * <p>Not thread safe: one client issues one request at a time, which is also what the session table's
+ * single-slot-per-client design assumes.
+ */
+public final class KeelClient implements AutoCloseable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(KeelClient.class);
+    private static final int MAX_ATTEMPTS = 12;
+
+    private final Map<Long, ManagedChannel> channels = new LinkedHashMap<>();
+    private final Map<Long, KvServiceGrpc.KvServiceBlockingStub> stubs = new LinkedHashMap<>();
+    private final List<Long> nodeIds;
+    private final long deadlineMillis;
+
+    private long preferred;
+    private long clientId;
+    private long sequence;
+
+    /** Connects to every node in {@code cluster}, mapping node id to {@code host:port}. */
+    public KeelClient(Map<Long, String> cluster) {
+        this(cluster, 5_000);
+    }
+
+    public KeelClient(Map<Long, String> cluster, long deadlineMillis) {
+        this.deadlineMillis = deadlineMillis;
+        cluster.forEach(
+                (id, address) -> {
+                    ManagedChannel channel = NettyChannelBuilder.forTarget(address).usePlaintext().build();
+                    channels.put(id, channel);
+                    stubs.put(id, KvServiceGrpc.newBlockingStub(channel));
+                });
+        this.nodeIds = new ArrayList<>(stubs.keySet());
+        this.preferred = nodeIds.isEmpty() ? 0 : nodeIds.get(0);
+    }
+
+    /** Opens a session so retries are deduplicated. Optional, but writes are safer with one. */
+    public long openSession() {
+        RegisterClientResponse response =
+                call(
+                        stub -> stub.registerClient(RegisterClientRequest.getDefaultInstance()),
+                        RegisterClientResponse::getHeader);
+        clientId = response.getClientId();
+        sequence = 0;
+        LOG.debug("opened session {}", clientId);
+        return clientId;
+    }
+
+    public void put(String key, String value) {
+        put(bytes(key), bytes(value));
+    }
+
+    public void put(ByteString key, ByteString value) {
+        Session session = nextSession();
+        call(
+                stub ->
+                        stub.put(
+                                PutRequest.newBuilder()
+                                        .setKey(key)
+                                        .setValue(value)
+                                        .setSession(session)
+                                        .build()),
+                response -> response.getHeader());
+    }
+
+    /** A linearizable read: the value is at least as new as any write that has already returned. */
+    public Optional<String> get(String key) {
+        return get(bytes(key), true).map(ByteString::toStringUtf8);
+    }
+
+    public Optional<ByteString> get(ByteString key, boolean linearizable) {
+        GetResponse response =
+                call(
+                        stub ->
+                                stub.get(
+                                        GetRequest.newBuilder()
+                                                .setKey(key)
+                                                .setLinearizable(linearizable)
+                                                .build()),
+                        GetResponse::getHeader);
+        return response.getFound() ? Optional.of(response.getValue()) : Optional.empty();
+    }
+
+    public boolean delete(String key) {
+        Session session = nextSession();
+        return call(
+                        stub ->
+                                stub.delete(
+                                        DeleteRequest.newBuilder()
+                                                .setKey(bytes(key))
+                                                .setSession(session)
+                                                .build()),
+                        response -> response.getHeader())
+                .getFound();
+    }
+
+    /** Writes only if the key currently holds {@code expected}, or is absent when it is null. */
+    public boolean compareAndSwap(String key, String expected, String value) {
+        Session session = nextSession();
+        CasRequest.Builder request =
+                CasRequest.newBuilder().setKey(bytes(key)).setValue(bytes(value)).setSession(session);
+        if (expected == null) {
+            request.setExpectAbsent(true);
+        } else {
+            request.setExpected(bytes(expected));
+        }
+        CasResponse response = call(stub -> stub.compareAndSwap(request.build()), CasResponse::getHeader);
+        return response.getApplied();
+    }
+
+    public StatusResponse status(long nodeId) {
+        KvServiceGrpc.KvServiceBlockingStub stub = stubs.get(nodeId);
+        if (stub == null) {
+            throw new IllegalArgumentException("no such node: " + nodeId);
+        }
+        return stub.withDeadlineAfter(deadlineMillis, TimeUnit.MILLISECONDS)
+                .status(StatusRequest.getDefaultInstance());
+    }
+
+    /**
+     * Sends a request, following leader hints and retrying transient failures.
+     *
+     * <p>A timeout is retried with the same sequence number on purpose: the state machine will either
+     * apply it once or return the answer it already produced. That is the entire reason for sessions.
+     */
+    private <T> T call(
+            Function<KvServiceGrpc.KvServiceBlockingStub, T> request,
+            Function<T, ResponseHeader> headerOf) {
+        RuntimeException last = null;
+        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+            long target = preferred == 0 ? nodeIds.get(attempt % nodeIds.size()) : preferred;
+            KvServiceGrpc.KvServiceBlockingStub stub = stubs.get(target);
+            if (stub == null) {
+                preferred = 0;
+                continue;
+            }
+            try {
+                T response =
+                        request.apply(stub.withDeadlineAfter(deadlineMillis, TimeUnit.MILLISECONDS));
+                ResponseHeader header = headerOf.apply(response);
+                switch (header.getCode()) {
+                    case ERROR_CODE_OK -> {
+                        preferred = target;
+                        return response;
+                    }
+                    case ERROR_CODE_NOT_LEADER -> {
+                        // Go straight to the node it named rather than starting discovery over.
+                        preferred = header.getLeaderHint();
+                        last = new IllegalStateException(header.getMessage());
+                    }
+                    case ERROR_CODE_NO_LEADER, ERROR_CODE_TIMEOUT -> {
+                        preferred = 0;
+                        last = new IllegalStateException(header.getMessage());
+                    }
+                    default ->
+                            throw new IllegalStateException(
+                                    header.getCode() + ": " + header.getMessage());
+                }
+            } catch (RuntimeException e) {
+                // Unreachable node: try another one.
+                preferred = 0;
+                last = e;
+            }
+            sleepBriefly(attempt);
+        }
+        throw new IllegalStateException("gave up after " + MAX_ATTEMPTS + " attempts", last);
+    }
+
+    private Session nextSession() {
+        if (clientId == 0) {
+            return Session.getDefaultInstance();
+        }
+        return Session.newBuilder().setClientId(clientId).setSequence(++sequence).build();
+    }
+
+    private static void sleepBriefly(int attempt) {
+        try {
+            // Enough for an election to finish, without turning a retry loop into a busy wait.
+            Thread.sleep(Math.min(50L * (attempt + 1), 400L));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while retrying", e);
+        }
+    }
+
+    private static ByteString bytes(String s) {
+        return ByteString.copyFromUtf8(s);
+    }
+
+    /** True when the response header says the call succeeded. */
+    public static boolean isOk(ResponseHeader header) {
+        return header.getCode() == ErrorCode.ERROR_CODE_OK;
+    }
+
+    @Override
+    public void close() {
+        channels.values().forEach(ManagedChannel::shutdownNow);
+        channels.clear();
+        stubs.clear();
+    }
+}
