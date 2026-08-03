@@ -4,6 +4,7 @@ import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import io.keel.proto.kv.Session;
+import io.keel.proto.service.AddMemberRequest;
 import io.keel.proto.service.CasRequest;
 import io.keel.proto.service.CasResponse;
 import io.keel.proto.service.DeleteRequest;
@@ -11,8 +12,10 @@ import io.keel.proto.service.ErrorCode;
 import io.keel.proto.service.GetRequest;
 import io.keel.proto.service.GetResponse;
 import io.keel.proto.service.KvServiceGrpc;
+import io.keel.proto.service.MemberChangeResponse;
 import io.keel.proto.service.PutRequest;
 import io.keel.proto.service.RegisterClientRequest;
+import io.keel.proto.service.RemoveMemberRequest;
 import io.keel.proto.service.RegisterClientResponse;
 import io.keel.proto.service.ResponseHeader;
 import io.keel.proto.service.StatusRequest;
@@ -141,6 +144,35 @@ public final class KeelClient implements AutoCloseable {
         }
         CasResponse response = call(stub -> stub.compareAndSwap(request.build()), CasResponse::getHeader);
         return response.getApplied();
+    }
+
+    /**
+     * Adds a voter and returns the membership afterwards.
+     *
+     * <p>The address travels in the configuration entry, so every node learns it from the log rather
+     * than needing its own configuration updated.
+     */
+    public List<Long> addMember(long nodeId, String address) {
+        MemberChangeResponse response =
+                call(
+                        stub ->
+                                stub.addMember(
+                                        AddMemberRequest.newBuilder()
+                                                .setNodeId(nodeId)
+                                                .setAddress(address)
+                                                .build()),
+                        MemberChangeResponse::getHeader);
+        return response.getVotersList();
+    }
+
+    public List<Long> removeMember(long nodeId) {
+        MemberChangeResponse response =
+                call(
+                        stub ->
+                                stub.removeMember(
+                                        RemoveMemberRequest.newBuilder().setNodeId(nodeId).build()),
+                        MemberChangeResponse::getHeader);
+        return response.getVotersList();
     }
 
     public StatusResponse status(long nodeId) {

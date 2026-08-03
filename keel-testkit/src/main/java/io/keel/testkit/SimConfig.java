@@ -19,6 +19,8 @@ package io.keel.testkit;
  * @param restartProbability chance per tick of bringing a crashed node back
  * @param electionTimeoutTicks base election timeout handed to every node
  * @param heartbeatTicks leader heartbeat interval
+ * @param initialVoters how many of the nodes start as voters; 0 means all of them. The rest exist and
+ *     run but are not members yet, which is what a node waiting to join a cluster looks like.
  * @param snapshotThresholdEntries take a snapshot and compact once a node's log holds this many
  *     entries beyond its snapshot boundary; 0 disables compaction entirely. A small value is
  *     deliberately unrealistic: it makes every run cross the paths where a follower has to be caught
@@ -37,6 +39,7 @@ public record SimConfig(
         double restartProbability,
         int electionTimeoutTicks,
         int heartbeatTicks,
+        int initialVoters,
         int snapshotThresholdEntries) {
 
     public SimConfig {
@@ -56,6 +59,10 @@ public record SimConfig(
         if (snapshotThresholdEntries < 0) {
             throw new IllegalArgumentException("snapshotThresholdEntries cannot be negative");
         }
+        if (initialVoters < 0 || initialVoters > nodes) {
+            throw new IllegalArgumentException(
+                    "initialVoters " + initialVoters + " is not in [0," + nodes + "]");
+        }
     }
 
     private static void checkProbability(String name, double value) {
@@ -71,7 +78,7 @@ public record SimConfig(
      * the cluster never got anything done, which is the classic false negative.
      */
     public static SimConfig quiet(int nodes, long seed) {
-        return new SimConfig(nodes, seed, 1, 2, 0, 0, 0, 0, 0, 0, 10, 1, 16);
+        return new SimConfig(nodes, seed, 1, 2, 0, 0, 0, 0, 0, 0, 10, 1, 0, 16);
     }
 
     /**
@@ -79,12 +86,12 @@ public record SimConfig(
      * progress often enough for the safety checks to have something to check.
      */
     public static SimConfig chaotic(int nodes, long seed) {
-        return new SimConfig(nodes, seed, 1, 6, 0.03, 0.02, 0.01, 0.05, 0.005, 0.05, 10, 1, 12);
+        return new SimConfig(nodes, seed, 1, 6, 0.03, 0.02, 0.01, 0.05, 0.005, 0.05, 10, 1, 0, 12);
     }
 
     /** Faults with no recovery pressure: partitions and crashes heal rarely. */
     public static SimConfig brutal(int nodes, long seed) {
-        return new SimConfig(nodes, seed, 1, 12, 0.10, 0.05, 0.04, 0.03, 0.02, 0.03, 10, 1, 8);
+        return new SimConfig(nodes, seed, 1, 12, 0.10, 0.05, 0.04, 0.03, 0.02, 0.03, 10, 1, 0, 8);
     }
 
     public SimConfig withSeed(long seed) {
@@ -101,6 +108,7 @@ public record SimConfig(
                 restartProbability,
                 electionTimeoutTicks,
                 heartbeatTicks,
+                initialVoters,
                 snapshotThresholdEntries);
     }
 
@@ -118,6 +126,7 @@ public record SimConfig(
                 restartProbability,
                 electionTimeoutTicks,
                 heartbeatTicks,
+                initialVoters,
                 snapshotThresholdEntries);
     }
 
@@ -136,6 +145,36 @@ public record SimConfig(
                 restartProbability,
                 electionTimeoutTicks,
                 heartbeatTicks,
+                initialVoters,
                 0);
+    }
+
+    /** Starts with only the first {@code count} nodes as voters; the rest wait to be added. */
+    public SimConfig withInitialVoters(int count) {
+        return new SimConfig(
+                nodes,
+                seed,
+                minLatencyTicks,
+                maxLatencyTicks,
+                dropProbability,
+                duplicateProbability,
+                partitionProbability,
+                healProbability,
+                crashProbability,
+                restartProbability,
+                electionTimeoutTicks,
+                heartbeatTicks,
+                count,
+                snapshotThresholdEntries);
+    }
+
+    /** The nodes that start as voters. */
+    public java.util.Set<Long> voterIds() {
+        java.util.Set<Long> ids = new java.util.TreeSet<>();
+        int count = initialVoters == 0 ? nodes : initialVoters;
+        for (long id = 1; id <= count; id++) {
+            ids.add(id);
+        }
+        return ids;
     }
 }

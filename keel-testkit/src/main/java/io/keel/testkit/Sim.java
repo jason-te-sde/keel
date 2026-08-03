@@ -108,7 +108,7 @@ public final class Sim {
         for (long id = 1; id <= config.nodes(); id++) {
             nodes.put(id, new Node(id));
         }
-        Set<Long> voters = new TreeSet<>(nodes.keySet());
+        Set<Long> voters = config.voterIds();
         for (Node node : nodes.values()) {
             // A distinct derived seed per node, so two nodes do not pick identical election timeouts
             // for the whole run and split every vote.
@@ -223,6 +223,10 @@ public final class Sim {
             node.lastAppliedTerm = entry.getTerm();
             if (entry.getType() == EntryType.ENTRY_TYPE_NORMAL) {
                 node.stateMachine.apply(entry.getIndex(), entry.getData());
+            } else if (entry.getType() == EntryType.ENTRY_TYPE_CONF_CHANGE) {
+                // The change takes effect on apply, not on append. A driver that skips this leaves the
+                // node disagreeing with the cluster about who votes.
+                node.raft.applyConfChange(RaftNode.decodeConfChange(entry));
             }
         }
         node.reads.addAll(ready.readStates());
@@ -256,6 +260,10 @@ public final class Sim {
                         .setLastIndex(applied)
                         .setLastTerm(node.lastAppliedTerm)
                         .setSizeBytes(out.size())
+                        // The membership has to travel with the snapshot: a node restoring from it
+                        // cannot recover the configuration from the log, because the entries that
+                        // carried the changes are exactly what the snapshot replaced.
+                        .setConf(node.raft.confState())
                         .build();
         node.snapshotPayload = out.toByteArray();
         node.snapshotMeta = meta;
@@ -363,7 +371,7 @@ public final class Sim {
         }
         node.raft =
                 RaftNode.restore(
-                        configFor(id, new TreeSet<>(nodes.keySet())),
+                        configFor(id, config.voterIds()),
                         node.store,
                         new Random(config.seed() * 1_000_003L + id + tick));
         node.down = false;
@@ -482,6 +490,40 @@ public final class Sim {
             }
         }
         return java.util.Optional.empty();
+    }
+
+    /**
+     * Proposes adding a voter, on whichever node is leader.
+     *
+     * @return the index the change was assigned, or -1 if there was nobody to accept it
+     */
+    public long addVoter(long id) {
+        return proposeConfChange(id, io.keel.proto.log.ConfChange.Type.TYPE_ADD_VOTER);
+    }
+
+    /** Proposes removing a voter. */
+    public long removeVoter(long id) {
+        return proposeConfChange(id, io.keel.proto.log.ConfChange.Type.TYPE_REMOVE_VOTER);
+    }
+
+    private long proposeConfChange(long id, io.keel.proto.log.ConfChange.Type type) {
+        OptionalLong leader = leader();
+        if (leader.isEmpty()) {
+            return -1;
+        }
+        try {
+            return node(leader.getAsLong())
+                    .raft
+                    .proposeConfChange(
+                            io.keel.proto.log.ConfChange.newBuilder().setType(type).setNodeId(id).build());
+        } catch (RuntimeException e) {
+            return -1;
+        }
+    }
+
+    /** The membership a node currently believes in. */
+    public Set<Long> voters(long id) {
+        return node(id).raft.voters();
     }
 
     /** The snapshot boundary a node has compacted to. */

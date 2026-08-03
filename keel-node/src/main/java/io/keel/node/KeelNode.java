@@ -11,6 +11,8 @@ import io.keel.kv.StateMachine;
 import io.keel.proto.kv.CommandResult;
 import io.keel.proto.log.Entry;
 import io.keel.proto.log.EntryType;
+import io.keel.proto.log.ConfChange;
+import io.keel.proto.log.EntryType;
 import io.keel.proto.log.SnapshotMetadata;
 import io.keel.proto.raft.InstallSnapshotAck;
 import io.keel.proto.raft.InstallSnapshotChunk;
@@ -108,10 +110,21 @@ public final class KeelNode implements AutoCloseable {
     private final ScheduledExecutorService ticker;
 
     private final Map<Long, PeerLink> peers = new HashMap<>();
+
+    /**
+     * Where every known node lives, updated as the membership changes.
+     *
+     * <p>Addresses arrive in the configuration entries themselves, so a node added while this one was
+     * offline is still reachable after a replay: the log is the only place membership comes from.
+     */
+    private final Map<Long, String> addresses = new java.util.concurrent.ConcurrentHashMap<>();
+
     private final SnapshotStore snapshots;
     private final LinkedBlockingQueue<Entry> applyQueue = new LinkedBlockingQueue<>();
     private final Map<Long, PendingWrite> pendingWrites = new ConcurrentHashMap<>();
     private final Map<Long, PendingRead> pendingReads = new ConcurrentHashMap<>();
+    private final Map<Long, CompletableFuture<java.util.Set<Long>>> pendingMembership =
+            new ConcurrentHashMap<>();
     private final AtomicLong readRequestIds = new AtomicLong();
     private final AtomicBoolean running = new AtomicBoolean();
 
@@ -192,18 +205,11 @@ public final class KeelNode implements AutoCloseable {
         if (!running.compareAndSet(false, true)) {
             throw new IllegalStateException("already started");
         }
-        for (Map.Entry<Long, String> peer : options.cluster().entrySet()) {
-            if (peer.getKey() == options.nodeId()) {
-                continue;
+        addresses.putAll(options.cluster());
+        for (long peer : options.cluster().keySet()) {
+            if (peer != options.nodeId()) {
+                connect(peer);
             }
-            ManagedChannel channel =
-                    NettyChannelBuilder.forTarget(peer.getValue()).usePlaintext().build();
-            peers.put(
-                    peer.getKey(),
-                    new PeerLink(
-                            channel,
-                            RaftServiceGrpc.newBlockingStub(channel),
-                            RaftServiceGrpc.newStub(channel)));
         }
 
         try {
@@ -232,6 +238,34 @@ public final class KeelNode implements AutoCloseable {
         return this;
     }
 
+    /** Opens a channel to a peer, if one is not open already. */
+    private synchronized void connect(long peer) {
+        if (peers.containsKey(peer)) {
+            return;
+        }
+        String address = addresses.get(peer);
+        if (address == null) {
+            LOG.warn("no address known for node {}; cannot connect", peer);
+            return;
+        }
+        ManagedChannel channel = NettyChannelBuilder.forTarget(address).usePlaintext().build();
+        peers.put(
+                peer,
+                new PeerLink(
+                        channel,
+                        RaftServiceGrpc.newBlockingStub(channel),
+                        RaftServiceGrpc.newStub(channel)));
+        LOG.info("node {} connected to node {} at {}", options.nodeId(), peer, address);
+    }
+
+    private synchronized void disconnect(long peer) {
+        PeerLink link = peers.remove(peer);
+        if (link != null) {
+            link.channel().shutdownNow();
+            LOG.info("node {} disconnected from node {}", options.nodeId(), peer);
+        }
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Client API
     // ---------------------------------------------------------------------------------------------
@@ -255,6 +289,31 @@ public final class KeelNode implements AutoCloseable {
                             // A previous leader assigned this index to something else and lost it.
                             displaced.future().completeExceptionally(new OverwrittenException(index));
                         }
+                        drainReady();
+                    } catch (RuntimeException e) {
+                        future.completeExceptionally(e);
+                    }
+                });
+        return future;
+    }
+
+    /**
+     * Proposes a membership change and completes when it has been applied.
+     *
+     * <p>One at a time: a second change offered while the first is unapplied is refused, because two in
+     * flight can produce two disjoint majorities and therefore two leaders in one term.
+     */
+    public CompletableFuture<java.util.Set<Long>> changeMembership(ConfChange change) {
+        CompletableFuture<java.util.Set<Long>> future = new CompletableFuture<>();
+        raftLoop.execute(
+                () -> {
+                    try {
+                        if (change.getType() == ConfChange.Type.TYPE_ADD_VOTER
+                                && !change.getAddress().isEmpty()) {
+                            addresses.put(change.getNodeId(), change.getAddress());
+                        }
+                        long index = raft.proposeConfChange(change);
+                        pendingMembership.put(index, future);
                         drainReady();
                     } catch (RuntimeException e) {
                         future.completeExceptionally(e);
@@ -539,6 +598,9 @@ public final class KeelNode implements AutoCloseable {
                         SnapshotMetadata.newBuilder()
                                 .setLastIndex(boundary)
                                 .setLastTerm(boundaryTerm)
+                                // A node restoring from this cannot recover the membership from the
+                                // log: the entries that carried it are what the snapshot replaced.
+                                .setConf(raft.confState())
                                 .build(),
                         out.toByteArray());
         snapshotIndex = boundary;
@@ -595,10 +657,48 @@ public final class KeelNode implements AutoCloseable {
                 }
             }
         }
+        if (entry.getType() == EntryType.ENTRY_TYPE_CONF_CHANGE) {
+            applyConfChange(entry);
+        }
         appliedIndex = entry.getIndex();
         lastAppliedTerm = entry.getTerm();
         satisfyReads();
         maybeSnapshot();
+    }
+
+    /**
+     * Puts a committed membership change into effect.
+     *
+     * <p>The core has to be told on its own thread, and the transport has to follow: a node that has
+     * just been added needs a channel, and one that has been removed should not keep one.
+     */
+    private void applyConfChange(Entry entry) {
+        ConfChange change = RaftNode.decodeConfChange(entry);
+        if (change.getType() == ConfChange.Type.TYPE_ADD_VOTER && !change.getAddress().isEmpty()) {
+            addresses.put(change.getNodeId(), change.getAddress());
+        }
+        raftLoop.execute(
+                () -> {
+                    java.util.Set<Long> voters;
+                    try {
+                        voters = new java.util.TreeSet<>(raft.applyConfChange(change).getVotersList());
+                    } catch (RuntimeException e) {
+                        LOG.error("failed to apply a membership change at index {}", entry.getIndex(), e);
+                        return;
+                    }
+                    if (change.getType() == ConfChange.Type.TYPE_ADD_VOTER
+                            && change.getNodeId() != options.nodeId()) {
+                        connect(change.getNodeId());
+                    } else if (change.getType() == ConfChange.Type.TYPE_REMOVE_VOTER) {
+                        disconnect(change.getNodeId());
+                    }
+                    CompletableFuture<java.util.Set<Long>> waiting =
+                            pendingMembership.remove(entry.getIndex());
+                    if (waiting != null) {
+                        waiting.complete(voters);
+                    }
+                    drainReady();
+                });
     }
 
     /** Answers reads whose index the state machine has reached. Safe to call from either thread. */
@@ -765,6 +865,10 @@ public final class KeelNode implements AutoCloseable {
             pending.future().completeExceptionally(new IllegalStateException("node is shutting down"));
         }
         pendingWrites.clear();
+        for (CompletableFuture<java.util.Set<Long>> pending : pendingMembership.values()) {
+            pending.completeExceptionally(new IllegalStateException("node is shutting down"));
+        }
+        pendingMembership.clear();
         LOG.info("node {} stopped", options.nodeId());
     }
 

@@ -14,7 +14,9 @@ import java.util.TreeSet;
  * simulated hour in a few milliseconds and get exactly the same behaviour every time.
  *
  * @param nodeId this node's id; ids are positive, so 0 is available as "no node"
- * @param initialVoters the bootstrap membership, including this node
+ * @param initialVoters the bootstrap membership. A node joining an existing cluster need not be in
+ *     it: until the configuration entry adding it is applied it is a non-voter, which accepts entries
+ *     but does not campaign and is not counted in any quorum.
  * @param electionTimeoutTicks base ticks without contact from a leader before campaigning; the
  *     effective timeout is randomized in {@code [t, 2t)} to break up split votes
  * @param heartbeatTicks ticks between leader heartbeats; must be well below the election timeout
@@ -46,10 +48,12 @@ public record RaftConfig(
         // invocations, which is invisible to a determinism test that runs both replays in one JVM,
         // and showed up as a simulation that reproduced locally but not on another JDK.
         initialVoters = Collections.unmodifiableSet(new LinkedHashSet<>(new TreeSet<>(initialVoters)));
-        if (!initialVoters.contains(nodeId)) {
-            throw new IllegalArgumentException(
-                    "initialVoters " + initialVoters + " must contain this node " + nodeId);
+        if (initialVoters.isEmpty()) {
+            throw new IllegalArgumentException("initialVoters cannot be empty");
         }
+        // This node does not have to be one of them. A node joining an existing cluster starts as a
+        // non-voter: it accepts entries, does not campaign, and becomes a voter when the configuration
+        // entry that adds it is applied.
         if (electionTimeoutTicks <= heartbeatTicks) {
             // Otherwise followers time out faster than the leader can reach them and the cluster
             // never holds a stable leader.

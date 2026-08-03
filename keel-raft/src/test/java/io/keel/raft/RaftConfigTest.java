@@ -30,13 +30,22 @@ class RaftConfigTest {
     }
 
     @Test
-    @DisplayName("a node must be one of its own voters")
-    void nodeMustBeAVoter() {
-        IllegalArgumentException e =
-                assertThrows(
-                        IllegalArgumentException.class,
-                        () -> RaftConfig.builder(9).voters(1, 2, 3).build());
-        assertEquals(true, e.getMessage().contains("must contain this node"), e.getMessage());
+    @DisplayName("a node joining a cluster may start as a non-voter")
+    void joiningNodeNeedNotBeAVoter() {
+        // This is how a node joins: it runs with the cluster's current membership, accepts entries,
+        // and becomes a voter when the configuration entry adding it is applied.
+        RaftConfig cfg = RaftConfig.builder(9).voters(1, 2, 3).build();
+
+        assertEquals(3, cfg.initialVoters().size());
+        assertEquals(2, cfg.quorum(), "a non-voter is not part of the quorum it serves");
+    }
+
+    @Test
+    @DisplayName("an empty voter set is refused")
+    void emptyVotersRefused() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> RaftConfig.builder(1).voters(java.util.Set.of()).build());
     }
 
     @Test

@@ -5,6 +5,8 @@ import io.grpc.stub.StreamObserver;
 import io.keel.kv.Commands;
 import io.keel.proto.kv.CommandResult;
 import io.keel.proto.kv.Session;
+import io.keel.proto.log.ConfChange;
+import io.keel.proto.service.AddMemberRequest;
 import io.keel.proto.service.CasRequest;
 import io.keel.proto.service.CasResponse;
 import io.keel.proto.service.DeleteRequest;
@@ -13,9 +15,11 @@ import io.keel.proto.service.ErrorCode;
 import io.keel.proto.service.GetRequest;
 import io.keel.proto.service.GetResponse;
 import io.keel.proto.service.KvServiceGrpc;
+import io.keel.proto.service.MemberChangeResponse;
 import io.keel.proto.service.PutRequest;
 import io.keel.proto.service.PutResponse;
 import io.keel.proto.service.RegisterClientRequest;
+import io.keel.proto.service.RemoveMemberRequest;
 import io.keel.proto.service.RegisterClientResponse;
 import io.keel.proto.service.ResponseHeader;
 import io.keel.proto.service.StatusRequest;
@@ -133,6 +137,39 @@ final class KvServiceImpl extends KvServiceGrpc.KvServiceImplBase {
                         .build());
     }
 
+    @Override
+    public void addMember(AddMemberRequest request, StreamObserver<MemberChangeResponse> observer) {
+        changeMembership(
+                ConfChange.newBuilder()
+                        .setType(ConfChange.Type.TYPE_ADD_VOTER)
+                        .setNodeId(request.getNodeId())
+                        .setAddress(request.getAddress())
+                        .build(),
+                observer);
+    }
+
+    @Override
+    public void removeMember(
+            RemoveMemberRequest request, StreamObserver<MemberChangeResponse> observer) {
+        changeMembership(
+                ConfChange.newBuilder()
+                        .setType(ConfChange.Type.TYPE_REMOVE_VOTER)
+                        .setNodeId(request.getNodeId())
+                        .build(),
+                observer);
+    }
+
+    private void changeMembership(ConfChange change, StreamObserver<MemberChangeResponse> observer) {
+        try {
+            java.util.Set<Long> voters = await(node.changeMembership(change));
+            respond(
+                    observer,
+                    MemberChangeResponse.newBuilder().setHeader(ok()).addAllVoters(voters).build());
+        } catch (Failure failure) {
+            respond(observer, MemberChangeResponse.newBuilder().setHeader(failure.header()).build());
+        }
+    }
+
     private <T> void submit(
             ByteString command,
             StreamObserver<T> observer,
@@ -178,6 +215,11 @@ final class KvServiceImpl extends KvServiceGrpc.KvServiceImplBase {
             return notLeader.leaderHint() == 0
                     ? header(ErrorCode.ERROR_CODE_NO_LEADER, 0, cause.getMessage())
                     : header(ErrorCode.ERROR_CODE_NOT_LEADER, notLeader.leaderHint(), cause.getMessage());
+        }
+        if (cause instanceof IllegalStateException || cause instanceof IllegalArgumentException) {
+            // A refused membership change, such as a second one while the first is unapplied. Final and
+            // deterministic, so retrying elsewhere would not help.
+            return header(ErrorCode.ERROR_CODE_INVALID, 0, cause.getMessage());
         }
         if (cause instanceof KeelNode.OverwrittenException) {
             // The write demonstrably did not commit, so retrying is safe and correct.
