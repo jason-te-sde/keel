@@ -11,7 +11,7 @@ New code lands in the cheapest layer that can catch its bugs.
 | Simulation | `keel-testkit` | seeded fault injection, invariants after every step |
 | Integration | `keel-node` | three nodes, real sockets, real files |
 
-190 tests, 86.4% line and 82.1% branch coverage on hand-written code. Coverage is a
+215 tests, 83.9% line and 78.0% branch coverage on hand-written code. Coverage is a
 smoke alarm, not a goal: the untested remainder is mostly `toString` and unreachable
 defensive branches, and a number near 100% usually means someone wrote tests for
 `toString`.
@@ -103,10 +103,15 @@ about three seconds.
 
 Stated because a testing document that only lists strengths is marketing.
 
-- **No snapshot or compaction testing**, because neither exists yet. When they land the
-  simulator needs a compaction fault, and the interesting case is a snapshot arriving at a
-  follower that is mid-append.
-- **No membership change testing**, same reason.
+- **Compaction is exercised, but not adversarially enough.** The simulator compacts on a
+  threshold of 8 to 16 entries so every seed crosses the snapshot paths, and the soak asserts
+  snapshots happened. What it does not do is inject a *failure* during compaction: a crash
+  between writing a snapshot and compacting the log, or a snapshot arriving at a follower that
+  is mid-append.
+- **Membership changes are tested for the rules, not for the interleavings.** Adding, removing,
+  a leader removing itself, a rejected second change, and survival across both replay and
+  snapshot are all covered. Membership changes happening *while* the cluster is partitioning and
+  crashing are not part of the random fault set yet, and that is where the remaining risk is.
 - **The simulator does not serialize anything.** It hands core messages straight from one
   node to another, so a codec bug is only caught by the integration tests. That is a
   deliberate split: serialization bugs are shallow and consensus bugs are not.

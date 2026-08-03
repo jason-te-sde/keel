@@ -1,181 +1,294 @@
-# keel
+<h1 align="center">keel</h1>
 
-A linearizable distributed key-value store in Java, built on a Raft implementation
-written from scratch, with a deterministic fault-injection simulator and a
-linearizability checker as part of the project rather than as an afterthought.
+<p align="center">
+  A linearizable distributed key-value store in Java.<br>
+  Raft written from scratch, a deterministic fault-injection simulator, and a linearizability checker.
+</p>
 
-The goal was never another Raft library. It was a store whose correctness claims can
-be tested: every safety property in the Raft paper is asserted after every step of a
-seeded simulation, and the histories clients actually observed are checked for
-linearizability under crashes and network partitions.
+<p align="center">
+  <a href="https://github.com/jason-te-sde/keel/actions/workflows/ci.yml">
+    <img alt="CI" src="https://github.com/jason-te-sde/keel/actions/workflows/ci.yml/badge.svg">
+  </a>
+  <img alt="Java 21" src="https://img.shields.io/badge/Java-21%2B-orange">
+  <img alt="tests" src="https://img.shields.io/badge/tests-215-brightgreen">
+  <img alt="coverage" src="https://img.shields.io/badge/coverage-83.9%25-brightgreen">
+  <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
 
+---
+
+Most Raft projects prove they work by starting a cluster and watching it not fall over. This one
+asserts every safety property in the paper after **every step** of a seeded simulation, and then
+checks that what clients actually observed could have happened in some sequential order at all.
+
+Three things make it worth a read:
+
+- **The consensus core is a pure state machine.** No threads, no clock, no I/O, no locks. A whole
+  cluster's behaviour — message latency, partitions, crashes, election timeouts — is a function of one
+  integer seed, so a bug found at seed 8123 is still there at seed 8123 tomorrow.
+- **The test suite found bugs that hand-written tests structurally could not.** Six of them, listed
+  below with what caught each one.
+- **It runs.** Three nodes, `kill -9` the leader, read your value back.
+
+## Try it
+
+```bash
+mvn package -DskipTests
+./scripts/local-cluster.sh          # three nodes on 9001-9003
 ```
-$ keelctl --cluster=1=127.0.0.1:9001,2=127.0.0.1:9002,3=127.0.0.1:9003 status
+
+```console
+$ keelctl --cluster=$CLUSTER status
 node 1  FOLLOWER  term=1  leader=2  commit=1  applied=1  keys=0
 node 2  LEADER    term=1  leader=2  commit=1  applied=1  keys=0
 node 3  FOLLOWER  term=1  leader=2  commit=1  applied=1  keys=0
 
-$ keelctl ... put greeting hello
+$ keelctl --cluster=$CLUSTER put greeting hello
 ok
-$ kill -9 <leader pid>
-$ keelctl ... get greeting
-hello
+
+$ kill -9 <pid of node 2>
+
+$ keelctl --cluster=$CLUSTER status
+node 1  LEADER    term=2  leader=1  commit=6  applied=6  keys=1
+node 2  unreachable (Connection refused)
+node 3  FOLLOWER  term=2  leader=1  commit=6  applied=6  keys=1
+
+$ keelctl --cluster=$CLUSTER get greeting
+hello                                    # committed data survived the failover
+
+$ keelctl --cluster=$CLUSTER member add 4=127.0.0.1:9004
+voters: [1, 2, 3, 4]                     # a fourth node joins a running cluster
 ```
 
-## What works
+Requires JDK 21+ and Maven 3.9+. Nothing else — `protoc` and the gRPC generator are fetched by the
+build.
 
-- **Consensus**: leader election with pre-vote, check-quorum, log replication with
-  conflict-index backtracking, and the commit rule that refuses to count entries from
-  earlier terms
-- **Durability**: a segmented, checksummed, append-only write-ahead log that recovers
-  from a crash at any byte and refuses to start on damage a crash cannot explain
-- **Linearizable reads** via ReadIndex, on leaders and on followers, with no log writes
-  on the read path
-- **Exactly-once writes**: client sessions that deduplicate a retry, snapshotted as part
-  of the state machine
-- **Two state machine backends**: on the heap, or RocksDB
-- **gRPC transport**, a server, a client that follows leader hints, and a CLI
+## Architecture
 
-## What does not work yet
+```mermaid
+flowchart TB
+    subgraph client["client side"]
+        CTL["keelctl"]
+        API["KeelClient<br/><i>leader hints, sessions</i>"]
+    end
 
-Stated plainly because a store without these is not a finished store:
+    subgraph node["keel-node · one process"]
+        GRPC["gRPC services"]
+        RAFTTHREAD["<b>raft thread</b><br/>owns the core, persists, sends"]
+        APPLY["<b>apply thread</b><br/>state machine, client futures"]
+    end
 
-- **No snapshots or log compaction** ([#3](https://github.com/jason-te-sde/keel/issues/3)).
-  The log grows without bound, restarts replay it from the beginning, and a follower
-  cannot be caught up from a snapshot. Nothing silently degrades: the core throws rather
-  than pretending it can send entries it has discarded.
-- **No membership changes** ([#4](https://github.com/jason-te-sde/keel/issues/4)).
-  The cluster is fixed at startup, so replacing a dead machine means restarting the
-  cluster.
-- No TLS or authentication, and no leader transfer.
+    subgraph core["keel-raft · pure state machine"]
+        RN["RaftNode<br/><i>no threads · no clock · no I/O · no locks</i>"]
+    end
+
+    WAL["keel-storage<br/><i>segmented, checksummed, append-only</i>"]
+    SM["keel-kv<br/><i>heap or RocksDB</i>"]
+
+    CTL --> API
+    API -- "gRPC" --> GRPC
+    GRPC -- "tasks" --> RAFTTHREAD
+    RAFTTHREAD -- "step / tick" --> RN
+    RN -- "Ready batch" --> RAFTTHREAD
+    RAFTTHREAD -- "persist then send" --> WAL
+    RAFTTHREAD -- "committed entries" --> APPLY
+    APPLY --> SM
+```
+
+The load-bearing rule is one sentence: **one thread owns the core**. Everything arriving from a socket
+or a client becomes a task on that thread, which is why the core needs no synchronization. Applying
+runs separately so a slow state machine cannot stall replication.
+
+`Ready` is the seam. The core returns a batch — hard state, entries, messages, committed entries — and
+the driver must **sync before it sends**, because an acknowledgement is a promise of durability and a
+leader counts acknowledgements toward a quorum. Making that one contract in one place is why the core
+is handed a read-only view of storage and cannot reach a disk even by accident.
+
+<details>
+<summary><b>The path of a write</b></summary>
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant L as leader
+    participant F as followers
+    participant SM as state machine
+
+    C->>L: Put(key, value, session)
+    L->>L: append entry, assign index
+    L->>L: write + fsync
+    L->>F: AppendEntries
+    F->>F: write + fsync
+    F-->>L: accepted
+    Note over L: quorum reached, and the entry<br/>is from the current term (5.4.2)
+    L->>SM: apply
+    SM-->>C: result
+```
+
+A retry of a timed-out write is deduplicated by the session table, so it applies exactly once. A write
+whose index gets taken by another command failed to commit and is reported as such, so retrying is
+safe.
+</details>
+
+<details>
+<summary><b>The path of a linearizable read</b></summary>
+
+Reading a leader's local state is <i>not</i> linearizable: a partitioned leader still believes it leads
+for up to one election timeout. ReadIndex (paper 6.4) needs both of these, and dropping either is the
+usual bug:
+
+1. The leader must have committed an entry in its <b>current term</b>, so it knows its own committed
+   prefix. That is what the no-op appended on election is for. Reads arriving earlier are held.
+2. The leader must confirm it is <b>still</b> the leader with a heartbeat round to a quorum, taken
+   <i>after</i> recording the index. Recording the commit index proves nothing on its own.
+
+Heartbeats carry a round token so a response cannot be counted toward a round it does not belong to.
+Followers forward the request, get an index back, wait for their own state machine to reach it, and
+serve the read themselves — so reads scale with the cluster and stay linearizable. Nothing is appended
+to the log.
+</details>
+
+## What is implemented
+
+| | Paper | Notes |
+| --- | :---: | --- |
+| Leader election, randomized timeouts | 5.2 | |
+| Log replication, conflict-index backtracking | 5.3 | Converges in a round trip per term, not per index |
+| Election restriction | 5.4.1 | |
+| Commit rule for earlier-term entries | 5.4.2 | The figure 8 case, with a test that holds it still |
+| Log compaction and snapshots | 7 | Streamed; the response means *installed*, not received |
+| Single-node membership changes | 4.3 | One at a time, so majorities always overlap |
+| Pre-vote | 9.6 | Plus a test that shows the term running away without it |
+| Check-quorum | 6.2 | |
+| Linearizable reads via ReadIndex | 6.4 | On leaders **and** followers |
+| Exactly-once client sessions | 6.3 | Part of the state machine, so snapshots carry them |
+| Crash-recoverable write-ahead log | — | Checksummed, append-only, torn tails survivable |
+
+Not implemented, on purpose: joint consensus, leader leases, leader transfer, learners, TLS,
+multi-raft. `docs/design/0004-scope.md` gives the reasoning for each.
 
 ## Numbers
 
-Every figure below came from a command in this repository, printed next to it. Hardware:
-Apple M-series laptop, APFS, JDK 21. They are here to be reproduced, not admired.
+Measured on an Apple M-series laptop, APFS, JDK 21. Every figure has the command that produced it.
 
 | | |
 | --- | --- |
-| Tests | 190 |
-| Line coverage (hand-written code) | 86.4% |
-| Branch coverage | 82.1% |
-| Simulation throughput | 83,684 ticks/s |
-| Simulation soak | 200 seeds, 240,000 invariant checks, 2.9s, zero violations |
-| Log append, no fsync | 256,660 entries/s (62.7 MiB/s) |
-| Log append, fsync per batch of 64 | 21,241 entries/s (5.2 MiB/s) |
-| Log append, fsync per entry | 334 entries/s |
-| Hand-written Java | 7,099 lines main, 3,931 lines test |
+| Tests | **215** (plus one benchmark, off by default) |
+| Line / branch coverage | **83.9% / 78.0%** |
+| Simulation throughput | **135,246 ticks/s** |
+| Soak run | 200 seeds, **240,000 invariant checks**, 10,462 snapshots, **1.8s**, zero violations |
+| Log append, no fsync | 226,253 entries/s (55.2 MiB/s) |
+| Log append, fsync per batch of 64 | 19,360 entries/s (4.7 MiB/s) |
+| Log append, fsync per entry | **336 entries/s** |
+| Hand-written Java | 8,686 lines main, 4,576 lines test |
 | Runtime dependencies | Protobuf, gRPC, RocksDB, SLF4J |
 
-That last row of the log benchmark is the one worth sitting with. Durable writes cost
-about 3ms each on this hardware, so batching a whole `Ready` into one fsync is worth
-roughly 60x. It is the reason the core hands the driver a batch instead of a stream of
-instructions.
-
-```
-mvn verify -Dcoverage                                    # tests and coverage
-mvn test -Dkeel.sim.seeds=200 -Dtest=SoakTest \
-    -Dsurefire.failIfNoSpecifiedTests=false              # simulation soak
+```bash
+mvn verify -Dcoverage                                       # tests + coverage
+mvn install -DskipTests && mvn test -pl keel-testkit \
+    -Dkeel.sim.seeds=200 -Dtest=SoakTest \
+    -Dsurefire.failIfNoSpecifiedTests=false                 # soak
 mvn test -Dkeel.bench=true -Dtest=SegmentedLogThroughputTest \
-    -Dsurefire.failIfNoSpecifiedTests=false              # log throughput
+    -Dsurefire.failIfNoSpecifiedTests=false                 # log throughput
 ```
 
-## Quick start
+That last benchmark row is the most useful number here. A durable write costs about 3ms on this
+hardware, so batching a whole `Ready` into one fsync is worth roughly **60x**. That measurement is why
+the core hands the driver a batch instead of a stream of instructions.
 
-Requires JDK 21 or newer and Maven 3.9 or newer. Nothing else: `protoc` and the gRPC
-code generator are fetched by the build.
+## How it is tested
 
-```
-mvn package -DskipTests
-./scripts/local-cluster.sh
-```
+Four layers, each covering what the cheaper one below it cannot:
 
-That starts three nodes on ports 9001 to 9003 with data under `run/`. In another shell:
+| Layer | Covers |
+| --- | --- |
+| **Unit** | one method, one state transition |
+| **Deterministic network** | multi-node message exchange, no clocks, no threads |
+| **Simulation** | seeded partitions, crashes, drops, duplicates, compaction — invariants after every step |
+| **Integration** | three nodes, real sockets, real files, real `kill -9` |
 
-```
-CLUSTER=1=127.0.0.1:9001,2=127.0.0.1:9002,3=127.0.0.1:9003
-JAR=keel-node/target/keel.jar
+The simulator asserts Election Safety, Log Matching, State Machine Safety, and term and commit
+monotonicity **after every step**, because a cluster that elects two leaders in one term and then
+recovers looks perfectly healthy by the time a run finishes.
 
-java -cp $JAR io.keel.node.Keelctl --cluster=$CLUSTER status
-java -cp $JAR io.keel.node.Keelctl --cluster=$CLUSTER put greeting hello
-java -cp $JAR io.keel.node.Keelctl --cluster=$CLUSTER get greeting
-java -cp $JAR io.keel.node.Keelctl --cluster=$CLUSTER cas greeting hello goodbye
-```
+The linearizability checker answers a different question. Invariants confirm replicas agree with each
+other; a store can do that flawlessly and still hand a client a value no sequential execution allows.
+So `SimLinearizabilityTest` runs the simulator with the read path **deliberately broken** in exactly
+the way a naive implementation breaks it, and asserts the checker rejects the resulting history.
+Without that test, a clean verdict on the correct path would prove nothing about the checker.
 
-Kill the leader with `kill -9` and read the key again. The value is still there and a
-new leader takes over within an election timeout.
+Every chaos test also asserts the run was actually hostile — messages dropped, proposals made,
+snapshots taken, invariants checked once per tick. A safety suite that passes because the cluster sat
+idle is the failure mode this project is most exposed to.
 
-## How it is built
+### Bugs the tests found
+
+<table>
+<tr><th>Bug</th><th>What caught it</th></tr>
+<tr>
+<td><b>Inverted pre-vote term check.</b> A <i>granted</i> pre-vote made the candidate step down, so
+multi-node clusters could never elect anyone.</td>
+<td>The first election test, before the branch had a commit.</td>
+</tr>
+<tr>
+<td><b>A lost probe stalled a follower forever.</b> Nothing cleared the paused flag, so a node that
+crashed mid-probe silently stopped receiving entries even after it came back.</td>
+<td>Designing the crash test, before writing it.</td>
+</tr>
+<tr>
+<td><b>Segments were replayed in base-index order.</b> A superseding append can create a
+lower-numbered segment <i>later</i>, so replay resurrected overwritten entries.</td>
+<td>A differential test against the in-memory store. No hand-written test came near it.</td>
+</tr>
+<tr>
+<td><b>Per-JVM nondeterminism.</b> Membership lived in a set whose iteration order the JDK randomizes
+per JVM, so message ordering differed between JVMs.</td>
+<td>The two-JDK CI matrix. The in-process determinism check <i>structurally could not</i> see it.</td>
+</tr>
+<tr>
+<td><b>A compaction marker discarded entries above its own boundary</b> on replay, losing the log tail
+on every restart after a compaction.</td>
+<td>A storage test written alongside compaction.</td>
+</tr>
+<tr>
+<td><b>Log Matching compared by list position.</b> Once nodes compact at different points their logs
+start at different indexes, so the checker compared index 5 against index 1.</td>
+<td>Enabling compaction in the simulator, which failed at eight seeds at once.</td>
+</tr>
+</table>
+
+`docs/testing.md` also lists what the suite does **not** cover — no torn-sector injection, crash
+injection lands between ticks rather than between instructions, no clock skew — because a testing
+document that only lists strengths is marketing.
+
+## Reading the code
+
+Ten minutes, in this order:
+
+| File | Why |
+| --- | --- |
+| [`raft/RaftNode.java`](keel-raft/src/main/java/io/keel/raft/RaftNode.java) | the state machine, with paper sections cited where an argument is relied on |
+| [`raft/Ready.java`](keel-raft/src/main/java/io/keel/raft/Ready.java) | the contract that makes persist-before-send structural |
+| [`testkit/Invariants.java`](keel-testkit/src/main/java/io/keel/testkit/Invariants.java) | the paper's safety properties as executable checks |
+| [`testkit/linz/Linearizability.java`](keel-testkit/src/main/java/io/keel/testkit/linz/Linearizability.java) | Wing and Gong search, decomposed per key and memoized |
+| [`storage/SegmentedLog.java`](keel-storage/src/main/java/io/keel/storage/SegmentedLog.java) | why the log is append-only even when overwriting |
+
+| Document | |
+| --- | --- |
+| [`docs/architecture.md`](docs/architecture.md) | layering, threads, and where the durability boundary is |
+| [`docs/testing.md`](docs/testing.md) | what each layer proves, and the known gaps |
+| [`docs/design/`](docs/design/) | one note per decision, each with its costs and rejected alternatives |
+
+## Layout
 
 ```
 keel-proto      wire and on-disk schemas; .proto is the source of truth
 keel-raft       consensus core: no threads, no clock, no I/O, no locks
-keel-storage    segmented write-ahead log
+keel-storage    segmented write-ahead log and compaction
 keel-kv         key-value state machine and client sessions
 keel-testkit    deterministic simulator, invariant checks, linearizability checker
 keel-node       gRPC transport, the thread that owns the core, client, CLI
 ```
-
-The decision everything else follows from: **the consensus core is a pure state
-machine**. Time arrives as `tick()`, messages as `step()`, and everything it wants done
-leaves as a `Ready` batch. It owns no threads, reads no clock, and cannot reach a disk
-or a socket even by accident, because it is handed a read-only view of storage.
-
-Two things fall out of that. A cluster's behaviour becomes a pure function of one seed,
-so a bug found at seed 8123 is still there at seed 8123 tomorrow. And the core needs no
-synchronization, because exactly one thread ever calls into it.
-
-`docs/architecture.md` covers the layering and the path a write and a read take.
-`docs/design/` holds one document per decision a reader might otherwise take for a
-mistake. `docs/testing.md` describes what the suite proves and what it does not.
-
-## Testing
-
-Four layers, each covering what the cheaper one below it cannot:
-
-| Layer | What it covers |
-| --- | --- |
-| Unit | one method or one state transition |
-| Deterministic network | multi-node message exchange with no clocks or threads |
-| Simulation | seeded fault injection with invariant checks after every step |
-| Integration | three nodes on real sockets and real files |
-
-The simulator asserts Election Safety, Log Matching, State Machine Safety, and term and
-commit monotonicity **after every step**, not at the end of a run. A cluster that elects
-two leaders in one term and then recovers looks perfectly healthy by the time a run
-finishes.
-
-The linearizability checker answers a different question. Invariants confirm replicas
-agree with each other; a store can do that flawlessly and still hand a client a value no
-sequential execution allows. `SimLinearizabilityTest` runs the simulator with the read
-path deliberately broken in exactly the way a naive implementation breaks it and asserts
-the checker rejects the resulting history. Without that test, a clean verdict on the
-correct path would say nothing.
-
-Three bugs worth mentioning, because they are why the strategy is shaped this way:
-
-1. The pre-vote term check was inverted, so a *granted* pre-vote made the candidate step
-   down and multi-node clusters could never elect anyone. Found by the first election
-   test, before the branch had a commit.
-2. Segments were replayed in base-index order, but a superseding append can create a
-   lower-numbered segment later, so replay could resurrect overwritten entries. Found by
-   a differential test against the in-memory store; no hand-written test came near it.
-3. Membership was held in a set whose iteration order the JDK randomizes per JVM, so
-   message ordering differed between JVM invocations. The in-process determinism check
-   could not see it because it replays both runs in one JVM. The two-JDK CI matrix found
-   it.
-
-## Reading the code
-
-If you have ten minutes and want the interesting parts:
-
-- `keel-raft/src/main/java/io/keel/raft/RaftNode.java` — the state machine, with paper
-  section references where an argument is being relied on
-- `keel-raft/src/main/java/io/keel/raft/Ready.java` — the ordering contract that makes
-  persist-before-send structural rather than a rule to remember
-- `keel-testkit/src/main/java/io/keel/testkit/Invariants.java` — the safety properties as
-  executable checks
-- `keel-testkit/src/main/java/io/keel/testkit/linz/Linearizability.java` — the checker
 
 ## License
 

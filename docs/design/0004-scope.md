@@ -1,37 +1,34 @@
 # 4. Scope: what is deliberately missing
 
 A reader who cannot tell an omission from an oversight has to assume the worst. This is
-the list, with reasoning.
+the list, with reasoning. Two entries here were gaps in v0.1.0 and are now implemented;
+their reasoning is kept because the decisions still constrain what comes next.
 
-## Snapshots and log compaction (issue #3)
+## Snapshots and log compaction
 
-**Missing.** The log grows without bound, restart replays it from the beginning, and a
-follower that falls behind the leader's oldest retained entry cannot be caught up.
+**Implemented.** The state machine can be serialized, the log prefix discarded, and a follower
+caught up from a snapshot streamed over its own RPC.
 
-Nothing degrades quietly: `sendAppend` throws if a peer needs a compacted entry, and
-because nothing compacts, that is unreachable today. The failure mode is disk and restart
-time, both visible.
+The decision worth recording is the split: the core decides when a snapshot is needed and which
+boundary it establishes, and never touches the payload. That keeps the core free of I/O, which is
+what keeps the simulator deterministic, and it puts the three orderings that matter — snapshot
+before compaction, verify before accept, install before append — in the driver where they can be
+stated once and tested.
 
-This is the largest gap and the next thing to build. When it lands it also needs a
-compaction fault in the simulator, and the interesting case is a snapshot arriving at a
-follower that is mid-append.
+Rejected: letting the core carry payload bytes in its messages. It would have made the transport
+trivial and the core untestable in the simulator, which is the wrong trade for this project.
 
-## Membership changes (issue #4)
+## Membership changes
 
-**Missing.** `RaftConfig` fixes the voters at startup, so replacing a dead machine means
-restarting the cluster.
+**Implemented**, single-node only.
 
-The plan is single-node changes only, and that is a decision rather than a shortcut. With
-one change at a time, the old and new majorities always overlap, so no joint configuration
-is needed. Joint consensus handles arbitrary reconfiguration and roughly doubles the
-membership state that every safety argument has to account for; for a store that grows
-from three nodes to five once, that is a bad trade.
+With one change in flight the old and new majorities always overlap, so no joint configuration is
+needed. Joint consensus handles arbitrary reconfiguration and roughly doubles the membership state
+that every safety argument must account for; for a cluster that grows from three nodes to five
+once, that is a bad trade. This remains a permanent decision rather than a stepping stone.
 
-The rules that will need enforcing, since they are where implementations lose safety:
-a configuration entry takes effect when it is *applied*, not when it is appended; a leader
-must not append a new one while an earlier one is uncommitted; a leader removed from the
-configuration steps down once that entry applies; a node not in the configuration does not
-campaign.
+Learners — non-voting replicas that catch up before promotion — are absent. They make adding a
+badly lagging node cheaper and change no safety argument, so they are a reasonable next addition.
 
 ## Leader leases
 
