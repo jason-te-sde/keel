@@ -125,6 +125,8 @@ public final class KeelNode implements AutoCloseable {
     private final Map<Long, String> addresses = new java.util.concurrent.ConcurrentHashMap<>();
 
     private final SnapshotStore snapshots;
+    private final NodeMetrics metrics = new NodeMetrics();
+    private MetricsServer metricsServer;
     private final LinkedBlockingQueue<Entry> applyQueue = new LinkedBlockingQueue<>();
     private final Map<Long, PendingWrite> pendingWrites = new ConcurrentHashMap<>();
     private final Map<Long, PendingRead> pendingReads = new ConcurrentHashMap<>();
@@ -254,6 +256,10 @@ public final class KeelNode implements AutoCloseable {
             throw new UncheckedIOException("failed to listen on port " + options.listenPort(), e);
         }
 
+        if (options.metricsPort() > 0) {
+            metricsServer = new MetricsServer(this, metrics, options.metricsPort()).start();
+        }
+
         applyLoop.execute(this::applyForever);
         ticker.scheduleAtFixedRate(
                 () -> raftLoop.execute(this::tickOnce),
@@ -340,6 +346,7 @@ public final class KeelNode implements AutoCloseable {
                 () -> {
                     try {
                         long index = raft.propose(command.toByteArray());
+                        metrics.writeAccepted();
                         PendingWrite displaced =
                                 pendingWrites.put(index, new PendingWrite(command, future));
                         if (displaced != null) {
@@ -373,6 +380,7 @@ public final class KeelNode implements AutoCloseable {
                         pendingMembership.put(index, future);
                         drainReady();
                     } catch (RuntimeException e) {
+                        metrics.writeRejected();
                         future.completeExceptionally(e);
                     }
                 });
@@ -388,6 +396,7 @@ public final class KeelNode implements AutoCloseable {
      */
     public CompletableFuture<ReadAnswer> read(ByteString key, boolean linearizable) {
         if (!linearizable) {
+            metrics.readServed();
             return CompletableFuture.completedFuture(new ReadAnswer(localRead(key), appliedIndex));
         }
         CompletableFuture<ReadAnswer> future = new CompletableFuture<>();
@@ -396,6 +405,14 @@ public final class KeelNode implements AutoCloseable {
         pendingReads.put(requestId, pending);
         future.whenComplete((answer, error) -> pendingReads.remove(requestId));
 
+        future.whenComplete(
+                (answer, error) -> {
+                    if (error == null) {
+                        metrics.readServed();
+                    } else {
+                        metrics.readFailed();
+                    }
+                });
         raftLoop.execute(
                 () -> {
                     try {
@@ -435,6 +452,11 @@ public final class KeelNode implements AutoCloseable {
 
     public long appliedIndex() {
         return appliedIndex;
+    }
+
+    /** Port the metrics endpoints are on, or 0 when they are disabled. */
+    public int metricsPort() {
+        return metricsServer == null ? 0 : metricsServer.port();
     }
 
     /** Boundary of the newest snapshot this node has taken or installed, or 0 if it has none. */
@@ -516,7 +538,8 @@ public final class KeelNode implements AutoCloseable {
                                 .send(envelope);
                     } catch (RuntimeException e) {
                         // Raft treats a lost message as a lost message. Retries come from the next
-                        // heartbeat, so there is nothing to do but note it.
+                        // heartbeat, so there is nothing to do but count it.
+                        metrics.peerSendFailed();
                         LOG.debug("send to node {} failed: {}", message.to(), e.toString());
                     }
                 });
@@ -547,7 +570,9 @@ public final class KeelNode implements AutoCloseable {
                         InstallSnapshotAck ack = sendChunks(link, message, stored.meta(), payload);
                         landed = ack.getSuccess();
                         matchIndex = ack.getMatchIndex();
+                        metrics.snapshotSent();
                     } catch (RuntimeException e) {
+                        metrics.snapshotSendFailed();
                         LOG.warn("snapshot to node {} failed: {}", message.to(), e.toString());
                     }
                     long finalMatch = matchIndex;
@@ -628,6 +653,7 @@ public final class KeelNode implements AutoCloseable {
         appliedIndex = meta.getLastIndex();
         snapshotIndex = meta.getLastIndex();
         lastAppliedTerm = meta.getLastTerm();
+        metrics.snapshotInstalled();
         LOG.info("node {} installed a snapshot at index {}", options.nodeId(), meta.getLastIndex());
         satisfyReads();
     }
@@ -661,6 +687,7 @@ public final class KeelNode implements AutoCloseable {
                                 .build(),
                         out.toByteArray());
         snapshotIndex = boundary;
+        metrics.snapshotTaken();
         raftLoop.execute(
                 () -> {
                     try {
@@ -710,13 +737,16 @@ public final class KeelNode implements AutoCloseable {
                     pending.future().complete(result);
                 } else {
                     // Something else took that index, so this write was replaced before it committed.
+                    metrics.writeOverwritten();
                     pending.future().completeExceptionally(new OverwrittenException(entry.getIndex()));
                 }
             }
         }
         if (entry.getType() == EntryType.ENTRY_TYPE_CONF_CHANGE) {
             applyConfChange(entry);
+            metrics.membershipChanged();
         }
+        metrics.entryApplied();
         appliedIndex = entry.getIndex();
         lastAppliedTerm = entry.getTerm();
         satisfyReads();
@@ -891,6 +921,9 @@ public final class KeelNode implements AutoCloseable {
             return;
         }
         ticker.shutdownNow();
+        if (metricsServer != null) {
+            metricsServer.close();
+        }
         if (server != null) {
             server.shutdown();
             try {

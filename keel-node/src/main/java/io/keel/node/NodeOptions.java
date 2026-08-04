@@ -27,6 +27,9 @@ import java.util.TreeMap;
  *     heap
  * @param snapshotThresholdEntries take a snapshot and compact the log once this many entries have
  *     accumulated beyond the last snapshot; 0 disables compaction
+ * @param metricsPort port for the metrics and health endpoints; 0 disables them. Off by default
+ *     because a fixed default would collide the moment three nodes run on one host, which is exactly
+ *     what the local cluster script does.
  * @param security TLS and access control; see {@link SecurityOptions} for why the default refuses to
  *     bind a non-loopback address
  */
@@ -41,6 +44,7 @@ public record NodeOptions(
         Duration requestTimeout,
         Path stateMachineDir,
         int snapshotThresholdEntries,
+        int metricsPort,
         SecurityOptions security) {
 
     public NodeOptions {
@@ -64,6 +68,9 @@ public record NodeOptions(
             throw new IllegalArgumentException("snapshotThresholdEntries cannot be negative");
         }
         security = security == null ? SecurityOptions.none() : security;
+        if (metricsPort < 0 || metricsPort > 65535) {
+            throw new IllegalArgumentException("metricsPort " + metricsPort + " is not a port");
+        }
     }
 
     /**
@@ -83,6 +90,7 @@ public record NodeOptions(
                 Duration.ofSeconds(5),
                 null,
                 8192,
+                0,
                 SecurityOptions.none());
     }
 
@@ -104,31 +112,32 @@ public record NodeOptions(
                 Duration.ofSeconds(5),
                 null,
                 8192,
+                0,
                 SecurityOptions.none());
     }
 
     public NodeOptions withTick(Duration tick) {
         return new NodeOptions(
                 nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
-                requestTimeout, stateMachineDir, snapshotThresholdEntries, security);
+                requestTimeout, stateMachineDir, snapshotThresholdEntries, metricsPort, security);
     }
 
     public NodeOptions withRequestTimeout(Duration timeout) {
         return new NodeOptions(
                 nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks, timeout,
-                stateMachineDir, snapshotThresholdEntries, security);
+                stateMachineDir, snapshotThresholdEntries, metricsPort, security);
     }
 
     public NodeOptions withRocksDb(Path directory) {
         return new NodeOptions(
                 nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
-                requestTimeout, directory, snapshotThresholdEntries, security);
+                requestTimeout, directory, snapshotThresholdEntries, metricsPort, security);
     }
 
     public NodeOptions withSnapshotThreshold(int entries) {
         return new NodeOptions(
                 nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
-                requestTimeout, stateMachineDir, entries, security);
+                requestTimeout, stateMachineDir, entries, metricsPort, security);
     }
 
     /**
@@ -142,11 +151,18 @@ public record NodeOptions(
         return 2 * 1024 * 1024;
     }
 
+    /** Enables the metrics and health endpoints on {@code port}. */
+    public NodeOptions withMetricsPort(int port) {
+        return new NodeOptions(
+                nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
+                requestTimeout, stateMachineDir, snapshotThresholdEntries, port, security);
+    }
+
     /** Replaces the security configuration. */
     public NodeOptions withSecurity(SecurityOptions security) {
         return new NodeOptions(
                 nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
-                requestTimeout, stateMachineDir, snapshotThresholdEntries, security);
+                requestTimeout, stateMachineDir, snapshotThresholdEntries, metricsPort, security);
     }
 
     /** Host part of this node's own address, for the bind-time security check. */

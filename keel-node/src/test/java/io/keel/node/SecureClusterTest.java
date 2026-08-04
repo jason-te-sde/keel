@@ -169,6 +169,7 @@ class SecureClusterTest {
                                         Duration.ofSeconds(5),
                                         null,
                                         16,
+                                        0,
                                         stranger))
                         .start();
         nodes.add(outsider);
@@ -241,6 +242,7 @@ class SecureClusterTest {
                                             Duration.ofSeconds(5),
                                             null,
                                             16,
+                                            0,
                                             security))
                             .start());
         }
