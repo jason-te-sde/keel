@@ -25,6 +25,12 @@ LABEL org.opencontainers.image.title="keel" \
       org.opencontainers.image.source="https://github.com/jason-te-sde/keel" \
       org.opencontainers.image.licenses="MIT"
 
+# curl is here only for the healthcheck. The obvious alternative, bash's /dev/tcp redirection,
+# does not exist: /bin/sh in this image is dash, and the check silently failed every time.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
 # Unprivileged, and owning only its data directory. A consensus node has no reason to be root.
 RUN useradd --system --create-home --uid 10001 keel
 COPY --from=build /src/keel-node/target/keel.jar /opt/keel/keel.jar

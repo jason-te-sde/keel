@@ -101,9 +101,13 @@ jobs:
           value=$(docker compose run --rm keelctl get greeting | tr -d '\r\n')
           test "$value" = "hello"
 
-      - name: logs on failure
-        if: failure()
-        run: docker compose logs --no-color --tail=200
+      # Always, not only on failure: when this job goes red the first question is whether the
+      # containers were even running, and the answer should not require re-running it.
+      - name: container state
+        if: always()
+        run: |
+          docker compose ps
+          docker compose logs --no-color --tail=100
 
       - name: tear down
         if: always()
