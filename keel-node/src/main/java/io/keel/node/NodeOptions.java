@@ -27,6 +27,8 @@ import java.util.TreeMap;
  *     heap
  * @param snapshotThresholdEntries take a snapshot and compact the log once this many entries have
  *     accumulated beyond the last snapshot; 0 disables compaction
+ * @param security TLS and access control; see {@link SecurityOptions} for why the default refuses to
+ *     bind a non-loopback address
  */
 public record NodeOptions(
         long nodeId,
@@ -38,7 +40,8 @@ public record NodeOptions(
         int heartbeatTicks,
         Duration requestTimeout,
         Path stateMachineDir,
-        int snapshotThresholdEntries) {
+        int snapshotThresholdEntries,
+        SecurityOptions security) {
 
     public NodeOptions {
         cluster = new LinkedHashMap<>(new TreeMap<>(cluster));
@@ -60,6 +63,7 @@ public record NodeOptions(
         if (snapshotThresholdEntries < 0) {
             throw new IllegalArgumentException("snapshotThresholdEntries cannot be negative");
         }
+        security = security == null ? SecurityOptions.none() : security;
     }
 
     /**
@@ -78,7 +82,8 @@ public record NodeOptions(
                 1,
                 Duration.ofSeconds(5),
                 null,
-                8192);
+                8192,
+                SecurityOptions.none());
     }
 
     /**
@@ -98,31 +103,57 @@ public record NodeOptions(
                 1,
                 Duration.ofSeconds(5),
                 null,
-                8192);
+                8192,
+                SecurityOptions.none());
     }
 
     public NodeOptions withTick(Duration tick) {
         return new NodeOptions(
                 nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
-                requestTimeout, stateMachineDir, snapshotThresholdEntries);
+                requestTimeout, stateMachineDir, snapshotThresholdEntries, security);
     }
 
     public NodeOptions withRequestTimeout(Duration timeout) {
         return new NodeOptions(
                 nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks, timeout,
-                stateMachineDir, snapshotThresholdEntries);
+                stateMachineDir, snapshotThresholdEntries, security);
     }
 
     public NodeOptions withRocksDb(Path directory) {
         return new NodeOptions(
                 nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
-                requestTimeout, directory, snapshotThresholdEntries);
+                requestTimeout, directory, snapshotThresholdEntries, security);
     }
 
     public NodeOptions withSnapshotThreshold(int entries) {
         return new NodeOptions(
                 nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
-                requestTimeout, stateMachineDir, entries);
+                requestTimeout, stateMachineDir, entries, security);
+    }
+
+    /**
+     * Largest request this node accepts, in bytes.
+     *
+     * <p>Fixed rather than configurable for now. It is below gRPC's four megabyte default so an
+     * oversized value is refused by this store with a reason, rather than by the transport with a
+     * message about frame sizes.
+     */
+    public int maxRequestBytes() {
+        return 2 * 1024 * 1024;
+    }
+
+    /** Replaces the security configuration. */
+    public NodeOptions withSecurity(SecurityOptions security) {
+        return new NodeOptions(
+                nodeId, cluster, bootstrapVoters, dataDir, tick, electionTimeoutTicks, heartbeatTicks,
+                requestTimeout, stateMachineDir, snapshotThresholdEntries, security);
+    }
+
+    /** Host part of this node's own address, for the bind-time security check. */
+    public String listenHost() {
+        String address = cluster.get(nodeId);
+        int colon = address.lastIndexOf(':');
+        return colon < 0 ? address : address.substring(0, colon);
     }
 
     public Set<Long> voters() {

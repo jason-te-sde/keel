@@ -411,7 +411,17 @@ class ClusterIntegrationTest {
 
     private NodeOptions optionsFor(long id, Path dataDir) {
         return new NodeOptions(
-                id, cluster, Set.of(), dataDir, TICK, 10, 1, Duration.ofSeconds(5), null, SNAPSHOT_EVERY);
+                id,
+                cluster,
+                Set.of(),
+                dataDir,
+                TICK,
+                10,
+                1,
+                Duration.ofSeconds(5),
+                null,
+                SNAPSHOT_EVERY,
+                SecurityOptions.none());
     }
 
     /** Options for a node that knows every address but is not a voter yet. */
@@ -426,7 +436,8 @@ class ClusterIntegrationTest {
                 1,
                 Duration.ofSeconds(5),
                 null,
-                SNAPSHOT_EVERY);
+                SNAPSHOT_EVERY,
+                SecurityOptions.none());
     }
 
     private Path dataDirOf(long id) {

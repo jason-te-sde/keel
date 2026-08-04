@@ -2,8 +2,13 @@ package io.keel.node;
 
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
+import io.grpc.ServerInterceptors;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
+import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.shaded.io.grpc.netty.NettyServerBuilder;
+import io.grpc.netty.shaded.io.netty.handler.ssl.ClientAuth;
+import io.grpc.netty.shaded.io.netty.handler.ssl.SslContext;
+import javax.net.ssl.SSLException;
 import io.grpc.stub.StreamObserver;
 import io.keel.kv.MemoryStateMachine;
 import io.keel.kv.RocksStateMachine;
@@ -212,13 +217,39 @@ public final class KeelNode implements AutoCloseable {
             }
         }
 
+        SecurityOptions security = options.security();
+        // Refuses to start rather than starting insecurely. An unauthenticated store reachable from a
+        // network is the kind of mistake that is only discovered by someone else.
+        security.checkUsableOn(options.listenHost());
+
         try {
-            server =
+            NettyServerBuilder builder =
                     NettyServerBuilder.forPort(options.listenPort())
+                            // A request larger than this is refused with a reason, instead of failing
+                            // inside gRPC's default limit in a way that says nothing useful.
+                            .maxInboundMessageSize(options.maxRequestBytes())
+                            // The peer protocol is guarded by mutual TLS, not by a token: an
+                            // unauthorised process fails the handshake and never sends a Raft message.
                             .addService(new RaftTransport())
-                            .addService(new KvServiceImpl(this))
-                            .build()
-                            .start();
+                            .addService(
+                                    ServerInterceptors.intercept(
+                                            new KvServiceImpl(this),
+                                            new AuthInterceptor(
+                                                    security.clientToken(), security.adminToken())));
+            if (security.tlsEnabled()) {
+                builder.sslContext(
+                        GrpcSslContexts.configure(
+                                        io.grpc.netty.shaded.io.netty.handler.ssl.SslContextBuilder
+                                                .forServer(
+                                                        security.certificate().toFile(),
+                                                        security.privateKey().toFile())
+                                                .trustManager(security.trustedCa().toFile())
+                                                // Certificates are the membership boundary, so a peer
+                                                // without one does not get to talk at all.
+                                                .clientAuth(ClientAuth.REQUIRE))
+                                .build());
+            }
+            server = builder.build().start();
         } catch (IOException e) {
             throw new UncheckedIOException("failed to listen on port " + options.listenPort(), e);
         }
@@ -231,10 +262,11 @@ public final class KeelNode implements AutoCloseable {
                 TimeUnit.MILLISECONDS);
 
         LOG.info(
-                "node {} listening on {} with cluster {}",
+                "node {} listening on {} with cluster {}, {}",
                 options.nodeId(),
                 options.cluster().get(options.nodeId()),
-                options.cluster().keySet());
+                options.cluster().keySet(),
+                security);
         return this;
     }
 
@@ -248,7 +280,7 @@ public final class KeelNode implements AutoCloseable {
             LOG.warn("no address known for node {}; cannot connect", peer);
             return;
         }
-        ManagedChannel channel = NettyChannelBuilder.forTarget(address).usePlaintext().build();
+        ManagedChannel channel = channelTo(address);
         peers.put(
                 peer,
                 new PeerLink(
@@ -256,6 +288,31 @@ public final class KeelNode implements AutoCloseable {
                         RaftServiceGrpc.newBlockingStub(channel),
                         RaftServiceGrpc.newStub(channel)));
         LOG.info("node {} connected to node {} at {}", options.nodeId(), peer, address);
+    }
+
+    /**
+     * Opens a channel to {@code address}, with mutual TLS when it is configured.
+     *
+     * <p>The node presents its own certificate here as well as verifying the peer's, so authentication
+     * runs in both directions: a follower checks that the leader belongs to the cluster just as the
+     * leader checks the follower.
+     */
+    private ManagedChannel channelTo(String address) {
+        SecurityOptions security = options.security();
+        if (!security.tlsEnabled()) {
+            return NettyChannelBuilder.forTarget(address).usePlaintext().build();
+        }
+        try {
+            SslContext ssl =
+                    GrpcSslContexts.forClient()
+                            .keyManager(
+                                    security.certificate().toFile(), security.privateKey().toFile())
+                            .trustManager(security.trustedCa().toFile())
+                            .build();
+            return NettyChannelBuilder.forTarget(address).sslContext(ssl).build();
+        } catch (SSLException e) {
+            throw new IllegalStateException("failed to build a TLS channel to " + address, e);
+        }
     }
 
     private synchronized void disconnect(long peer) {
