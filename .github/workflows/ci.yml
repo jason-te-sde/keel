@@ -52,7 +52,7 @@ jobs:
               if (miss+cov > 0) printf "%-40s %6.1f%% lines\n", f, 100*cov/(miss+cov)
             }' "$f"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: jacoco
           path: '**/target/site/jacoco/**'
