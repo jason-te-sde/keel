@@ -566,12 +566,14 @@ public final class KeelNode implements AutoCloseable {
                                                         new IllegalStateException(
                                                                 "no snapshot on disk covering index "
                                                                         + message.meta().getLastIndex()));
-                        byte[] payload = snapshots.read(stored);
-                        InstallSnapshotAck ack = sendChunks(link, message, stored.meta(), payload);
+                        InstallSnapshotAck ack;
+                        try (java.io.InputStream payload = snapshots.open(stored)) {
+                            ack = sendChunks(link, message, stored.meta(), payload);
+                        }
                         landed = ack.getSuccess();
                         matchIndex = ack.getMatchIndex();
                         metrics.snapshotSent();
-                    } catch (RuntimeException e) {
+                    } catch (RuntimeException | IOException e) {
                         metrics.snapshotSendFailed();
                         LOG.warn("snapshot to node {} failed: {}", message.to(), e.toString());
                     }
@@ -592,7 +594,11 @@ public final class KeelNode implements AutoCloseable {
     }
 
     private InstallSnapshotAck sendChunks(
-            PeerLink link, RaftMessage.InstallSnapshot message, SnapshotMetadata meta, byte[] payload) {
+            PeerLink link,
+            RaftMessage.InstallSnapshot message,
+            SnapshotMetadata meta,
+            java.io.InputStream payload)
+            throws IOException {
         java.util.concurrent.CompletableFuture<InstallSnapshotAck> answer = new CompletableFuture<>();
         StreamObserver<InstallSnapshotChunk> stream =
                 link.asyncStub()
@@ -615,16 +621,33 @@ public final class KeelNode implements AutoCloseable {
                                     }
                                 });
         try {
-            for (int offset = 0; offset < Math.max(payload.length, 1); offset += SNAPSHOT_CHUNK_BYTES) {
-                int end = Math.min(offset + SNAPSHOT_CHUNK_BYTES, payload.length);
+            // One chunk in memory at a time, whatever the snapshot's size.
+            byte[] buffer = new byte[SNAPSHOT_CHUNK_BYTES];
+            long offset = 0;
+            int read;
+            boolean sentAnything = false;
+            while ((read = payload.read(buffer)) > 0) {
                 stream.onNext(
                         InstallSnapshotChunk.newBuilder()
                                 .setTerm(message.term())
                                 .setLeaderId(options.nodeId())
                                 .setMeta(meta)
                                 .setOffset(offset)
-                                .setData(ByteString.copyFrom(payload, offset, end - offset))
-                                .setLast(end >= payload.length)
+                                .setData(ByteString.copyFrom(buffer, 0, read))
+                                .setLast(false)
+                                .build());
+                offset += read;
+                sentAnything = true;
+            }
+            if (!sentAnything) {
+                // An empty state machine is still a snapshot, and the receiver needs the metadata.
+                stream.onNext(
+                        InstallSnapshotChunk.newBuilder()
+                                .setTerm(message.term())
+                                .setLeaderId(options.nodeId())
+                                .setMeta(meta)
+                                .setOffset(0)
+                                .setLast(true)
                                 .build());
             }
             stream.onCompleted();
@@ -640,14 +663,25 @@ public final class KeelNode implements AutoCloseable {
 
     /** Installs a snapshot the core has accepted. Runs on the raft thread. */
     private void installSnapshot(SnapshotMetadata meta) {
-        byte[] payload = receivedSnapshot;
-        if (payload == null) {
-            throw new IllegalStateException(
-                    "the core accepted a snapshot at " + meta.getLastIndex() + " with no payload received");
-        }
-        receivedSnapshot = null;
-        synchronized (stateMachine) {
-            stateMachine.restore(new ByteArrayInputStream(payload));
+        // Read back from the file the transfer just wrote, rather than from an array held in memory.
+        // The receiver already verified its checksum, and this is the only copy that will survive a
+        // restart anyway.
+        SnapshotStore.Stored stored =
+                snapshots
+                        .latest()
+                        .filter(candidate -> candidate.meta().getLastIndex() >= meta.getLastIndex())
+                        .orElseThrow(
+                                () ->
+                                        new IllegalStateException(
+                                                "the core accepted a snapshot at "
+                                                        + meta.getLastIndex()
+                                                        + " but no such snapshot is on disk"));
+        try (java.io.InputStream payload = snapshots.open(stored)) {
+            synchronized (stateMachine) {
+                stateMachine.restore(payload);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to install a snapshot", e);
         }
         store.installSnapshot(meta);
         appliedIndex = meta.getLastIndex();
@@ -811,9 +845,6 @@ public final class KeelNode implements AutoCloseable {
     // Transport
     // ---------------------------------------------------------------------------------------------
 
-    /** Payload of a snapshot received but not yet accepted by the core. */
-    private volatile byte[] receivedSnapshot;
-
     /** Receives consensus messages and hands them to the thread that owns the core. */
     private final class RaftTransport extends RaftServiceGrpc.RaftServiceImplBase {
 
@@ -821,36 +852,59 @@ public final class KeelNode implements AutoCloseable {
         public StreamObserver<InstallSnapshotChunk> installSnapshot(
                 StreamObserver<InstallSnapshotAck> responseObserver) {
             return new StreamObserver<>() {
-                private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                // Chunks go straight to disk. Buffering the payload capped the store's practical size
+                // at the heap, for a reason that had nothing to do with consensus.
+                private SnapshotStore.Incoming incoming;
                 private SnapshotMetadata meta;
+                private boolean failed;
 
                 @Override
                 public void onNext(InstallSnapshotChunk chunk) {
-                    meta = chunk.getMeta();
-                    byte[] data = chunk.getData().toByteArray();
-                    buffer.write(data, 0, data.length);
+                    if (failed) {
+                        return;
+                    }
+                    try {
+                        meta = chunk.getMeta();
+                        if (incoming == null) {
+                            incoming = snapshots.receive(meta);
+                        }
+                        byte[] data = chunk.getData().toByteArray();
+                        incoming.write(data, data.length);
+                    } catch (RuntimeException e) {
+                        failed = true;
+                        LOG.warn("failed to write an incoming snapshot chunk: {}", e.toString());
+                    }
                 }
 
                 @Override
                 public void onError(Throwable error) {
                     LOG.warn("a snapshot stream failed: {}", error.toString());
+                    if (incoming != null) {
+                        incoming.close();
+                    }
                 }
 
                 @Override
                 public void onCompleted() {
-                    if (meta == null) {
-                        responseObserver.onNext(InstallSnapshotAck.getDefaultInstance());
+                    if (meta == null || failed) {
+                        if (incoming != null) {
+                            incoming.close();
+                        }
+                        responseObserver.onNext(
+                                InstallSnapshotAck.newBuilder()
+                                        .setFollowerId(options.nodeId())
+                                        .setSuccess(false)
+                                        .build());
                         responseObserver.onCompleted();
                         return;
                     }
-                    SnapshotMetadata received = meta;
-                    byte[] payload = buffer.toByteArray();
-                    // Durable and verified before the core is told about it, so the acknowledgement
-                    // means installed rather than merely received.
                     SnapshotMetadata stored;
                     try {
-                        stored = snapshots.accept(received, payload);
+                        // Durable and verified before the core is told, so the acknowledgement means
+                        // installed rather than merely received.
+                        stored = incoming.finish();
                     } catch (RuntimeException e) {
+                        incoming.close();
                         LOG.warn("rejecting a snapshot: {}", e.toString());
                         responseObserver.onNext(
                                 InstallSnapshotAck.newBuilder()
@@ -860,13 +914,13 @@ public final class KeelNode implements AutoCloseable {
                         responseObserver.onCompleted();
                         return;
                     }
-                    receivedSnapshot = payload;
+                    SnapshotMetadata received = meta;
                     raftLoop.execute(
                             () -> {
                                 try {
                                     raft.step(
                                             new RaftMessage.InstallSnapshot(
-                                                    received.getLastIndex() == 0 ? 0 : receivedFrom(received),
+                                                    receivedFrom(received),
                                                     options.nodeId(),
                                                     Math.max(received.getLastTerm(), raft.term()),
                                                     stored));
@@ -876,7 +930,8 @@ public final class KeelNode implements AutoCloseable {
                                                     .setTerm(raft.term())
                                                     .setFollowerId(options.nodeId())
                                                     .setSuccess(true)
-                                                    .setMatchIndex(Math.max(raft.commitIndex(), stored.getLastIndex()))
+                                                    .setMatchIndex(
+                                                            Math.max(raft.commitIndex(), stored.getLastIndex()))
                                                     .build());
                                 } catch (RuntimeException e) {
                                     LOG.warn("failed to install a snapshot", e);
