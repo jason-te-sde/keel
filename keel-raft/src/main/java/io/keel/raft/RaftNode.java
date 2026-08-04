@@ -494,6 +494,16 @@ public final class RaftNode {
             // The driver has installed it, so storage is authoritative again.
             log.snapshotInstalled();
         }
+        if (persisted > 0 && role == Role.LEADER) {
+            // A leader counts its own log toward a quorum only as far as the driver has made durable,
+            // so the durable boundary moving is itself a reason to recheck what is committed. Without
+            // this, a single-node cluster would never commit anything: nobody replies to it, so the
+            // only event that could advance its commit index is this one.
+            //
+            // Deliberately after the hard state is marked clean, because a new commit index has to be
+            // written and would otherwise be dropped along with the write that just completed.
+            maybeCommit();
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -856,9 +866,19 @@ public final class RaftNode {
         }
         leaderId = h.from();
         electionElapsed = 0;
-        // A heartbeat may advertise a commit index past the end of our log when we are behind, so
-        // clamp: committing an entry we do not have would be committing nothing.
-        if (log.commitTo(Math.min(h.leaderCommit(), log.lastIndex()))) {
+
+        // A heartbeat carries no entries, so it verifies nothing about this node's log. The only
+        // reason it may advance the commit index at all is that a leader advertises
+        // min(its commit index, what this follower has acknowledged), and an acknowledged index is
+        // one whose contents were checked against the leader's.
+        //
+        // So the advertised index must not be clamped to our own last index. Clamping was the bug:
+        // when a leader's view of this follower was ahead of the follower's log, the clamp turned a
+        // "commit up to what you acknowledged" instruction into "commit whatever you happen to
+        // have", and a follower with a divergent tail committed its own entries. If the advertised
+        // index is past our log, the leader's information is stale and the right answer is to wait
+        // for an AppendEntries that actually establishes agreement.
+        if (h.leaderCommit() <= log.lastIndex() && log.commitTo(h.leaderCommit())) {
             hardStateDirty = true;
         }
         send(new RaftMessage.HeartbeatReply(cfg.nodeId(), h.from(), term, h.readSeq()));
@@ -1014,13 +1034,38 @@ public final class RaftNode {
 
         SnapshotMetadata meta = message.meta();
         if (meta.getLastIndex() <= log.committed()) {
-            // Already covered by what this node has committed. Reporting the higher index keeps the
-            // leader from sending the same snapshot again.
+            // Already covered by what this node has committed.
+            //
+            // The reply reports this node's commit index rather than the snapshot's boundary. That is
+            // both safe and useful: an entry is only committed once a majority holds it, and the
+            // election restriction means whoever is leader now must hold every committed entry, so the
+            // two logs really do agree this far. Reporting the lower boundary instead would understate
+            // the match and leave the leader resending a snapshot this node has already outgrown.
             send(
                     new RaftMessage.InstallSnapshotReply(
                             cfg.nodeId(), message.from(), term, true, log.committed()));
             return;
         }
+
+        if (log.matchTerm(meta.getLastIndex(), meta.getLastTerm())) {
+            // We already hold the entry at the snapshot's boundary, so by Log Matching we hold its
+            // whole prefix and need no snapshot at all. Committing up to the boundary is enough.
+            //
+            // Restoring here instead would discard every entry above the boundary, and those may be
+            // entries this node has already acknowledged and a leader has already counted toward a
+            // quorum. Losing them leaves a committed entry on fewer than a majority, and a node
+            // without it can then win the next election. Paper figure 13, step 6.
+            if (log.commitTo(meta.getLastIndex())) {
+                hardStateDirty = true;
+            }
+            send(
+                    new RaftMessage.InstallSnapshotReply(
+                            cfg.nodeId(), message.from(), term, true, meta.getLastIndex()));
+            return;
+        }
+
+        // A different term at the boundary means this node's log diverges at or below it, so nothing
+        // above can have been committed and discarding all of it is safe.
         log.restore(meta);
         adoptConfState(meta.getConf());
         hardStateDirty = true;
@@ -1058,7 +1103,11 @@ public final class RaftNode {
         long[] matches = new long[voters.size()];
         int i = 0;
         for (long v : voters) {
-            matches[i++] = (v == cfg.nodeId()) ? log.lastIndex() : matchOf(v);
+            // This node contributes what it has actually persisted, not what it has appended. A
+            // follower's match index means "durably stored", because it only acknowledges after
+            // syncing, and the leader has to hold itself to the same standard. Counting an unsynced
+            // entry can commit something that a crash then leaves on fewer than a majority.
+            matches[i++] = (v == cfg.nodeId()) ? log.persistedIndex() : matchOf(v);
         }
         Arrays.sort(matches);
         // Largest index stored on a majority: with n voters and quorum q, that is the (n-q)th

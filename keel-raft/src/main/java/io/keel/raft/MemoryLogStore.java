@@ -172,6 +172,22 @@ public final class MemoryLogStore implements LogStore {
             throw new IllegalArgumentException(
                     "cannot compact to " + meta.getLastIndex() + " past the last index " + lastIndex());
         }
+        if (meta.getLastIndex() >= offset && meta.getLastIndex() <= lastIndex()) {
+            long actual = live.get((int) (meta.getLastIndex() - offset)).getTerm();
+            if (actual != meta.getLastTerm()) {
+                // Metadata that misdescribes its own boundary is worse than useless: a follower
+                // receiving this snapshot compares the term at the boundary to decide whether it can
+                // keep its own entries, and a wrong term makes it discard entries it has already
+                // acknowledged. That leaves a committed entry on fewer than a majority.
+                throw new IllegalArgumentException(
+                        "snapshot claims term "
+                                + meta.getLastTerm()
+                                + " at index "
+                                + meta.getLastIndex()
+                                + " but the log holds term "
+                                + actual);
+            }
+        }
         // Compaction is a point of no return: the entries it drops only exist in the state machine
         // snapshot from here on, so everything before it has to be durable first.
         sync();

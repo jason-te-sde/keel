@@ -48,6 +48,53 @@ class ReplicationTest {
     }
 
     @Test
+    @DisplayName("a heartbeat does not commit entries this node has not matched")
+    void heartbeatCannotCommitPastTheMatchingPrefix()
+    {
+        // The bug behind seed 1537. A heartbeat carries a commit index but no proof of what the log
+        // below it contains, so clamping it to this node's own last index commits whatever happens to
+        // sit there. If that entry came from a different leader it is not the committed one, and the
+        // node applies a command the cluster never agreed on.
+        RaftConfig cfg = RaftConfig.builder(2).voters(1, 2, 3).build();
+        TestDriver d = new TestDriver(cfg, 31);
+        d.store.append(
+                List.of(
+                        Entries.normal(1, 1, bytes("agreed")),
+                        Entries.normal(2, 1, bytes("divergent")),
+                        Entries.normal(3, 1, bytes("also divergent"))));
+        d.store.saveHardState(io.keel.proto.log.HardState.newBuilder().setTerm(1).build());
+        d.store.sync();
+        d.reopen();
+
+        // A new leader in term 2 says it has committed index 5. This node holds nothing at 4 or 5, so
+        // it has no way to know its own entries 2 and 3 are the ones that were committed.
+        d.raft.step(new RaftMessage.Heartbeat(1, 2, 2, 5, 0));
+        d.pump();
+
+        assertEquals(
+                0,
+                d.raft.commitIndex(),
+                "a commit index reaching past the log commits nothing, not the log's own tail");
+
+        // Once entries actually arrive and match, the same commit index is safe to accept.
+        d.raft.step(
+                new RaftMessage.Append(
+                        1,
+                        2,
+                        2,
+                        1,
+                        1,
+                        List.of(
+                                Entries.normal(2, 2, bytes("real")),
+                                Entries.normal(3, 2, bytes("real")),
+                                Entries.normal(4, 2, bytes("real")),
+                                Entries.normal(5, 2, bytes("real"))),
+                        5));
+        d.pump();
+        assertEquals(5, d.raft.commitIndex(), "matched entries can be committed");
+    }
+
+    @Test
     @DisplayName("a write offered to a follower is refused with a hint")
     void followerRefusesWrites() {
         TestCluster c = TestCluster.of(3).start();

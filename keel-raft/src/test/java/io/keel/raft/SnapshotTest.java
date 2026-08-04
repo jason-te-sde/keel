@@ -107,6 +107,68 @@ class SnapshotTest {
     }
 
     @Test
+    @DisplayName("a follower holding the boundary entry keeps its tail instead of discarding it")
+    void matchingBoundaryRetainsTheTail() {
+        // The bug behind seed 1695. This node has acknowledged entries above the snapshot's boundary,
+        // and a leader has counted them toward a quorum. Discarding them leaves a committed entry on
+        // fewer than a majority, and a node without it can then win the next election.
+        // Paper figure 13, step 6.
+        RaftConfig cfg = RaftConfig.builder(2).voters(1, 2, 3).build();
+        TestDriver d = new TestDriver(cfg, 21);
+        d.store.append(
+                List.of(
+                        Entries.normal(1, 1, bytes("a")),
+                        Entries.normal(2, 1, bytes("b")),
+                        Entries.normal(3, 1, bytes("c")),
+                        Entries.normal(4, 1, bytes("d"))));
+        d.store.saveHardState(io.keel.proto.log.HardState.newBuilder().setTerm(1).build());
+        d.store.sync();
+        d.reopen();
+
+        // A snapshot at index 2, whose term matches what this node holds there.
+        SnapshotMetadata meta =
+                SnapshotMetadata.newBuilder().setLastIndex(2).setLastTerm(1).build();
+        d.raft.step(new RaftMessage.InstallSnapshot(1, 2, 1, meta));
+        Ready ready = d.raft.ready();
+
+        assertNull(ready.snapshotToInstall(), "there is nothing to restore: we already have the prefix");
+        assertEquals(4, d.raft.lastIndex(), "and the entries above the boundary must survive");
+        assertEquals(2, d.raft.commitIndex(), "the boundary is committed by definition");
+
+        List<RaftMessage.InstallSnapshotReply> replies =
+                TestDriver.only(ready.messages(), RaftMessage.InstallSnapshotReply.class);
+        assertEquals(1, replies.size());
+        assertTrue(replies.get(0).success());
+        assertEquals(2, replies.get(0).matchIndex());
+    }
+
+    @Test
+    @DisplayName("a follower whose boundary entry conflicts still discards everything")
+    void conflictingBoundaryDiscardsTheLog() {
+        // The other half. A different term at the boundary means this log diverges at or below it, so
+        // nothing above can have been committed and discarding is the only correct move.
+        RaftConfig cfg = RaftConfig.builder(2).voters(1, 2, 3).build();
+        TestDriver d = new TestDriver(cfg, 22);
+        d.store.append(
+                List.of(
+                        Entries.normal(1, 1, bytes("a")),
+                        Entries.normal(2, 1, bytes("stale")),
+                        Entries.normal(3, 1, bytes("also stale"))));
+        d.store.saveHardState(io.keel.proto.log.HardState.newBuilder().setTerm(1).build());
+        d.store.sync();
+        d.reopen();
+
+        SnapshotMetadata meta =
+                SnapshotMetadata.newBuilder().setLastIndex(2).setLastTerm(5).build();
+        d.raft.step(new RaftMessage.InstallSnapshot(1, 2, 5, meta));
+        Ready ready = d.raft.ready();
+
+        assertNotNull(ready.snapshotToInstall(), "a conflicting boundary must be restored from");
+        assertEquals(2, ready.snapshotToInstall().getLastIndex());
+        assertEquals(2, d.raft.lastIndex(), "the divergent tail is gone");
+    }
+
+    @Test
     @DisplayName("a snapshot older than what the follower already has is acknowledged, not applied")
     void staleSnapshotIsAcknowledged() {
         RaftConfig cfg = RaftConfig.builder(2).voters(1, 2, 3).build();
@@ -184,5 +246,9 @@ class SnapshotTest {
         assertEquals(2, store.term(3));
         assertThrows(RaftStorage.CompactedException.class, () -> store.term(1));
         assertEquals(2, store.entries(3, 5, Long.MAX_VALUE).size());
+    }
+
+    private static byte[] bytes(String value) {
+        return value.getBytes(StandardCharsets.UTF_8);
     }
 }
