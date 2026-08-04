@@ -421,6 +421,7 @@ class ClusterIntegrationTest {
                 Duration.ofSeconds(5),
                 null,
                 SNAPSHOT_EVERY,
+                0,
                 SecurityOptions.none());
     }
 
@@ -437,6 +438,7 @@ class ClusterIntegrationTest {
                 Duration.ofSeconds(5),
                 null,
                 SNAPSHOT_EVERY,
+                0,
                 SecurityOptions.none());
     }
 

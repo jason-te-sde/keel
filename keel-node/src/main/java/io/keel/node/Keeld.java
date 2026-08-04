@@ -39,6 +39,9 @@ public final class Keeld {
         if (flags.containsKey("rocksdb")) {
             options = options.withRocksDb(Path.of(flags.get("rocksdb")));
         }
+        if (flags.containsKey("metrics-port")) {
+            options = options.withMetricsPort(Integer.parseInt(flags.get("metrics-port")));
+        }
         options = options.withSecurity(securityFrom(flags));
 
         KeelNode node = KeelNode.open(options).start();
@@ -84,6 +87,7 @@ public final class Keeld {
                   --data-dir=PATH        where the log lives (default data/<id>)
                   --rocksdb=PATH         keep state in RocksDB instead of on the heap
                   --tick-ms=N            logical tick in milliseconds (default 50)
+                  --metrics-port=N       serve /metrics, /healthz and /readyz on this port
 
                 security (required to listen on anything but loopback):
                   --tls-cert=PATH        PEM certificate chain this node presents
