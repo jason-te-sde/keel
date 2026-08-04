@@ -4,9 +4,9 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
-  <groupId>io.keel</groupId>
+  <groupId>io.github.jason-te-sde</groupId>
   <artifactId>keel-parent</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.3.0-SNAPSHOT</version>
   <packaging>pom</packaging>
 
   <name>keel</name>
@@ -20,8 +20,29 @@
     <license>
       <name>MIT License</name>
       <url>https://opensource.org/licenses/MIT</url>
+      <distribution>repo</distribution>
     </license>
   </licenses>
+
+  <developers>
+    <developer>
+      <id>jason-te-sde</id>
+      <name>Jason Te</name>
+      <url>https://github.com/jason-te-sde</url>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/jason-te-sde/keel.git</connection>
+    <developerConnection>scm:git:git@github.com:jason-te-sde/keel.git</developerConnection>
+    <url>https://github.com/jason-te-sde/keel</url>
+    <tag>HEAD</tag>
+  </scm>
+
+  <issueManagement>
+    <system>GitHub Issues</system>
+    <url>https://github.com/jason-te-sde/keel/issues</url>
+  </issueManagement>
 
   <modules>
     <module>keel-proto</module>
@@ -52,6 +73,10 @@
     <enforcer.plugin.version>3.5.0</enforcer.plugin.version>
     <shade.plugin.version>3.6.0</shade.plugin.version>
     <protobuf.plugin.version>0.6.1</protobuf.plugin.version>
+    <source.plugin.version>3.3.1</source.plugin.version>
+    <javadoc.plugin.version>3.11.2</javadoc.plugin.version>
+    <gpg.plugin.version>3.2.7</gpg.plugin.version>
+    <central.plugin.version>0.7.0</central.plugin.version>
     <os.plugin.version>1.7.1</os.plugin.version>
   </properties>
 
@@ -102,22 +127,22 @@
 
       <!-- Modules -->
       <dependency>
-        <groupId>io.keel</groupId>
+        <groupId>io.github.jason-te-sde</groupId>
         <artifactId>keel-proto</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>
-        <groupId>io.keel</groupId>
+        <groupId>io.github.jason-te-sde</groupId>
         <artifactId>keel-raft</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>
-        <groupId>io.keel</groupId>
+        <groupId>io.github.jason-te-sde</groupId>
         <artifactId>keel-storage</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>
-        <groupId>io.keel</groupId>
+        <groupId>io.github.jason-te-sde</groupId>
         <artifactId>keel-kv</artifactId>
         <version>${project.version}</version>
       </dependency>
@@ -222,6 +247,81 @@
   </build>
 
   <profiles>
+    <!-- Artifacts a consumer needs: the jar alone is not enough to read or debug against. -->
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>${source.plugin.version}</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals><goal>jar-no-fork</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>${javadoc.plugin.version}</version>
+            <configuration>
+              <!-- Reject broken references and malformed HTML, but not missing tags on internals.
+                   Failing a release because a package-private helper lacks an @param would make
+                   the check something to disable rather than something to satisfy. -->
+              <doclint>all,-missing</doclint>
+              <quiet>true</quiet>
+              <!-- keel-proto skips javadoc, so cross-linking to it would look for output that
+                   was never generated and log an error per module. -->
+              <detectOfflineLinks>false</detectOfflineLinks>
+            </configuration>
+            <executions>
+              <execution>
+                <id>attach-javadoc</id>
+                <goals><goal>jar</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
+    <!-- Signing and upload. Kept apart from `release` so building the release artifacts locally
+         does not require a GPG key, and so a mistake here cannot silently skip signing. -->
+    <profile>
+      <id>publish</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>${gpg.plugin.version}</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals><goal>sign</goal></goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>${central.plugin.version}</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <!-- Deliberately manual: a release should be looked at in the portal before it
+                   becomes permanent, because a published version can never be replaced. -->
+              <autoPublish>false</autoPublish>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
     <!-- Coverage runs under one JDK rather than the whole matrix: the JaCoCo
          agent has to understand the class file version of the JDK it runs on,
          which makes it the first thing to break on a new release. Enable with

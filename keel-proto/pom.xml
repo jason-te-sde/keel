@@ -5,9 +5,9 @@
   <modelVersion>4.0.0</modelVersion>
 
   <parent>
-    <groupId>io.keel</groupId>
+    <groupId>io.github.jason-te-sde</groupId>
     <artifactId>keel-parent</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.3.0-SNAPSHOT</version>
   </parent>
 
   <artifactId>keel-proto</artifactId>
@@ -16,6 +16,11 @@
     Wire and on-disk schemas. The .proto files are the source of truth; Java is
     generated at build time and never committed.
   </description>
+
+  <properties>
+    <!-- Generated sources; javadoc on them is noise, not documentation. -->
+    <maven.javadoc.skip>true</maven.javadoc.skip>
+  </properties>
 
   <dependencies>
     <dependency>

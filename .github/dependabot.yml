@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Protobuf, gRPC, and RocksDB have all had CVEs. Weekly rather than daily so a version bump
+  # is a considered change and not background noise; grouped so one pull request updates a
+  # coherent set rather than opening five that conflict with each other.
+  - package-ecosystem: maven
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      grpc-and-protobuf:
+        patterns:
+          - "io.grpc:*"
+          - "com.google.protobuf:*"
+      build-plugins:
+        patterns:
+          - "org.apache.maven.plugins:*"
+          - "org.jacoco:*"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci(deps)"
