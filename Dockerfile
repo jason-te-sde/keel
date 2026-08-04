@@ -46,8 +46,8 @@ ENV JAVA_OPTS="-XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError"
 
 # Readiness rather than liveness: a container that is up but cannot serve a read should not receive
 # traffic. Orchestrators that distinguish the two should use /healthz for liveness as well.
-HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=6 \
-    CMD ["/bin/sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/9101 && printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q '200'"]
+HEALTHCHECK --interval=5s --timeout=3s --start-period=20s --retries=12 \
+    CMD curl -fsS http://127.0.0.1:9101/readyz || exit 1
 
 ENTRYPOINT ["/bin/sh", "-c", "exec java $JAVA_OPTS -cp /opt/keel/keel.jar io.keel.node.Keeld \"$@\"", "--"]
 CMD ["--help"]
