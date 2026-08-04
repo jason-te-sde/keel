@@ -4,6 +4,86 @@ Notable changes, newest first. Versions follow [semantic versioning](https://sem
 and until 1.0 the wire format and the on-disk format may both change between minor
 versions.
 
+## v0.3.0
+
+The release that makes this usable by someone other than its author. v0.2.0 was a correct store
+that could not be published, could not be deployed safely, and could not be observed once running.
+
+### Security (#23)
+
+- **Mutual TLS** between nodes and to clients. The cluster CA is the membership boundary: a process
+  without a certificate signed by it fails the handshake and never sends a Raft message
+- TLS without a trusted CA is refused as a configuration error, because encryption without
+  authentication is not the useful half
+- A **client token**, and a **separate admin token** for membership changes. `RemoveMember` can eject
+  a node, and a credential that writes a value has no business doing that. Compared in constant time
+- **Secure by default**: a node refuses to bind a non-loopback address without both TLS and a token,
+  unless `--insecure` is passed. The error names the missing piece
+- Request size bounded below gRPC's default, so an oversized value is refused with a reason
+
+### Observability (#24)
+
+- Prometheus metrics, hand-written because the format is a few lines of text and a client library
+  would be the largest dependency in the project
+- `/healthz` and `/readyz` answering **different** questions. Readiness is false with no known leader
+  or a state machine more than 1000 entries behind; conflating them is how a rolling restart takes a
+  cluster down
+- Off unless a port is configured, since a fixed default collides when three nodes share a host
+
+### Packaging and operations (#25)
+
+- A properties config file, with flags overriding it, so an image can ship what a deployment shares
+- A container image running unprivileged, sizing the heap from the container limit, health-checking
+  `/readyz`. CI builds it, brings up the compose stack, writes and reads, then kills the leader and
+  reads the value back
+- `docs/operations.md`: tick tuning against real round trips, disk sizing, what to alert on, backup
+  and restore, upgrades, and a symptom-to-cause table
+- Logging configuration. Log4j2 had none, so a node failing to elect looked identical to an idle one
+
+### Distribution (#22, #26)
+
+- Group id is now `io.github.jason-te-sde`; `io.keel` could never be published, since that namespace
+  requires controlling `keel.io`. Java packages stay `io.keel`
+- A `release` profile attaching sources and javadoc, separate from a `publish` profile that signs and
+  uploads, so building locally needs no GPG key
+- Pushing a tag builds, verifies, and attaches a checksummed runnable jar
+- Aggregate javadoc published to GitHub Pages
+- `SECURITY.md` with a private reporting route and an explicit list of what is **not** defended,
+  `CODE_OF_CONDUCT.md`, `CODEOWNERS`, and Dependabot for Maven and Actions
+- `RELEASING.md`, which leads with the admission that the first two tags were cut while every POM
+  said `0.1.0-SNAPSHOT`
+
+### Snapshots (#27)
+
+- Streamed in both directions, one chunk in memory, so a state machine may exceed the heap
+- An abandoned transfer leaves nothing behind, because a half-written snapshot is indistinguishable
+  from a good one and the log gets compacted on the strength of it
+
+### Bugs found while building this
+
+- **A single-node cluster could not commit anything.** `maybeCommit` only ran on a reply, and a lone
+  voter is its own majority that nobody replies to. Found by writing a backup test, which was the
+  first thing to run one node and write to it
+- **Log4j2 had no configuration**, so a node failing to elect a leader looked exactly like an idle one
+- **The container health check used a bash feature** that the image's dash shell does not have, and
+  the first attempt to fix it edited a string that was not in the file
+- **An orphaned Javadoc comment** failed `-Werror` on JDK 25 only, which has a lint JDK 21 does not
+
+### Measured on an Apple M-series laptop, JDK 21
+
+| | |
+| --- | --- |
+| Tests | 246 |
+| Line / branch coverage | 83.9% / 78.4% |
+| Simulation | 146,038 ticks/s; 200 seeds, 240,000 invariant checks, 10,462 snapshots in 1.6s |
+| Log append, fsync per batch of 64 | 19,708 entries/s |
+| Log append, fsync per entry | 328 entries/s |
+
+### Still absent, on purpose
+
+Joint consensus, leader leases, leader transfer, learners, certificate rotation without a restart,
+rate limiting, encryption at rest, multi-raft.
+
 ## v0.2.0
 
 Closes the two gaps v0.1.0 shipped with. The Raft implementation is now feature complete for

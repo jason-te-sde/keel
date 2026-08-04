@@ -10,8 +10,9 @@
     <img alt="CI" src="https://github.com/jason-te-sde/keel/actions/workflows/ci.yml/badge.svg">
   </a>
   <img alt="Java 21" src="https://img.shields.io/badge/Java-21%2B-orange">
-  <img alt="tests" src="https://img.shields.io/badge/tests-215-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-246-brightgreen">
   <img alt="coverage" src="https://img.shields.io/badge/coverage-83.9%25-brightgreen">
+  <img alt="Maven Central" src="https://img.shields.io/badge/maven--central-pending-lightgrey">
   <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
 </p>
 
@@ -28,7 +29,9 @@ Three things make it worth a read:
   integer seed, so a bug found at seed 8123 is still there at seed 8123 tomorrow.
 - **The test suite found bugs that hand-written tests structurally could not.** Six of them, listed
   below with what caught each one.
-- **It runs.** Three nodes, `kill -9` the leader, read your value back.
+- **It runs, and it is meant to be run by someone else.** Mutual TLS, token-authenticated clients,
+  Prometheus metrics, a container image CI actually builds and exercises, and an operations guide
+  written for three in the morning.
 
 ## Try it
 
@@ -202,8 +205,22 @@ to the log.
 | Exactly-once client sessions | 6.3 | Part of the state machine, so snapshots carry them |
 | Crash-recoverable write-ahead log | — | Checksummed, append-only, torn tails survivable |
 
-Not implemented, on purpose: joint consensus, leader leases, leader transfer, learners, TLS,
-multi-raft. `docs/design/0004-scope.md` gives the reasoning for each.
+And the parts that are about being run rather than about consensus:
+
+| | Notes |
+| --- | --- |
+| Mutual TLS between nodes | the cluster CA is the membership boundary: a foreign certificate fails the handshake |
+| Token-authenticated clients | with a **separate** admin token, because ejecting a node is not the same privilege as writing a value |
+| Secure by default | a node refuses to bind a non-loopback address without TLS and a token, unless `--insecure` |
+| Prometheus metrics | plus `/healthz` and `/readyz`, which answer different questions |
+| Container image | built and exercised by CI, not just committed |
+| Config file | properties, with flags overriding |
+| Streamed snapshots | one chunk in memory on each side, so a state machine may exceed the heap |
+
+Not implemented, on purpose: joint consensus, leader leases, leader transfer, learners,
+certificate rotation without restart, rate limiting, multi-raft.
+[`docs/design/0004-scope.md`](docs/design/0004-scope.md) gives the reasoning for each, and
+[`SECURITY.md`](SECURITY.md) states what the project does and does not defend against.
 
 ## Numbers
 
@@ -211,14 +228,14 @@ Measured on an Apple M-series laptop, APFS, JDK 21. Every figure has the command
 
 | | |
 | --- | --- |
-| Tests | **215** (plus one benchmark, off by default) |
-| Line / branch coverage | **83.9% / 78.0%** |
-| Simulation throughput | **135,246 ticks/s** |
-| Soak run | 200 seeds, **240,000 invariant checks**, 10,462 snapshots, **1.8s**, zero violations |
-| Log append, no fsync | 226,253 entries/s (55.2 MiB/s) |
-| Log append, fsync per batch of 64 | 19,360 entries/s (4.7 MiB/s) |
-| Log append, fsync per entry | **336 entries/s** |
-| Hand-written Java | 8,686 lines main, 4,576 lines test |
+| Tests | **246** (plus one benchmark, off by default) |
+| Line / branch coverage | **83.9% / 78.4%** |
+| Simulation throughput | **146,038 ticks/s** |
+| Soak run | 200 seeds, **240,000 invariant checks**, 10,462 snapshots, **1.6s**, zero violations |
+| Log append, no fsync | 108,081 entries/s (26.4 MiB/s) |
+| Log append, fsync per batch of 64 | 19,708 entries/s (4.8 MiB/s) |
+| Log append, fsync per entry | **328 entries/s** |
+| Hand-written Java | 9,791 lines main, 5,775 lines test |
 | Runtime dependencies | Protobuf, gRPC, RocksDB, SLF4J |
 
 ```bash
@@ -233,6 +250,32 @@ mvn test -Dkeel.bench=true -Dtest=SegmentedLogThroughputTest \
 That last benchmark row is the most useful number here. A durable write costs about 3ms on this
 hardware, so batching a whole `Ready` into one fsync is worth roughly **60x**. That measurement is why
 the core hands the driver a batch instead of a stream of instructions.
+
+The unsynced figure moves by a factor of two between runs on a laptop, which is worth saying rather
+than quietly picking the best one. The two fsync rows are stable, and they are the ones that describe
+what the store actually promises.
+
+## Deploying it
+
+```bash
+keeld --config=/etc/keel/keel.properties --id=1
+```
+
+A node **refuses to listen on a non-loopback address** without TLS and a client token, unless
+`--insecure` is passed. That is deliberate: a laptop stays one command, and exposing an
+unauthenticated store becomes something you have to mean.
+
+| | |
+| --- | --- |
+| Peer authentication | mutual TLS; the cluster CA decides who may speak the protocol at all |
+| Client authentication | `--client-token`, and `--admin-token` for membership changes |
+| Metrics | `--metrics-port`, then `/metrics`, `/healthz`, `/readyz` |
+| Config | a properties file, with flags overriding it |
+
+[`docs/operations.md`](docs/operations.md) covers tick tuning against real round trips, disk sizing,
+what to alert on, backup and restore, upgrades, and a symptom-to-cause table.
+[`SECURITY.md`](SECURITY.md) is explicit about what is not defended: Raft assumes crash faults
+rather than Byzantine ones, data at rest is unencrypted, and there is no rate limiting.
 
 ## How it is tested
 
@@ -292,6 +335,17 @@ on every restart after a compaction.</td>
 <td><b>Log Matching compared by list position.</b> Once nodes compact at different points their logs
 start at different indexes, so the checker compared index 5 against index 1.</td>
 <td>Enabling compaction in the simulator, which failed at eight seeds at once.</td>
+</tr>
+<tr>
+<td><b>A single-node cluster could not commit anything.</b> <code>maybeCommit</code> only ran when a
+reply arrived, and a lone voter is its own majority that nobody ever replies to. It committed its
+election no-op and then nothing, forever.</td>
+<td>Writing a backup test, which was the first thing to run one node <i>and write to it</i>.</td>
+</tr>
+<tr>
+<td><b>An orphaned Javadoc comment.</b> Trivial, and listed because of how it was found: JDK 25 has a
+lint JDK 21 does not, so <code>-Werror</code> failed on exactly one job.</td>
+<td>The two-JDK matrix, for the second time.</td>
 </tr>
 </table>
 
