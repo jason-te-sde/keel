@@ -343,6 +343,22 @@ public final class SegmentedLog implements LogStore {
             throw new IllegalArgumentException(
                     "cannot compact to " + meta.getLastIndex() + " past the last index " + lastIndex());
         }
+        if (meta.getLastIndex() >= firstIndex && meta.getLastIndex() <= lastIndex()) {
+            long actual = locations.get((int) (meta.getLastIndex() - firstIndex)).term();
+            if (actual != meta.getLastTerm()) {
+                // A follower receiving this snapshot compares the term at the boundary to decide
+                // whether it may keep its own entries. A wrong term makes it discard entries it has
+                // already acknowledged, which can leave a committed entry on fewer than a majority.
+                throw new IllegalArgumentException(
+                        "snapshot claims term "
+                                + meta.getLastTerm()
+                                + " at index "
+                                + meta.getLastIndex()
+                                + " but the log holds term "
+                                + actual);
+            }
+        }
+
         // The marker is a normal appended record, so a crash either has it or does not; there is no
         // state where the log is compacted but does not say so. It is synced before any segment is
         // deleted, because deleting first would leave a log whose entries are gone and whose

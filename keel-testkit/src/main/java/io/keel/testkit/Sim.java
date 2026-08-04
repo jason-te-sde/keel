@@ -60,7 +60,16 @@ public final class Sim {
         SnapshotMetadata snapshotMeta = SnapshotMetadata.getDefaultInstance();
         byte[] snapshotPayload = new byte[0];
 
-        /** Term of the highest entry applied, needed to label a snapshot. */
+        /**
+         * Index and term of the highest entry applied, as a pair.
+         *
+         * <p>They have to come from the same entry. Taking the index from the state machine, which
+         * only sees client commands, and the term from the last entry applied of any kind produced a
+         * snapshot whose advertised term did not match its own index whenever a no-op or
+         * configuration entry followed a command across a term boundary.
+         */
+        long lastAppliedIndex;
+
         long lastAppliedTerm;
 
         Node(long id) {
@@ -220,6 +229,7 @@ public final class Sim {
         }
         for (Entry entry : ready.committedEntries()) {
             node.applied.add(entry);
+            node.lastAppliedIndex = entry.getIndex();
             node.lastAppliedTerm = entry.getTerm();
             if (entry.getType() == EntryType.ENTRY_TYPE_NORMAL) {
                 node.stateMachine.apply(entry.getIndex(), entry.getData());
@@ -247,12 +257,12 @@ public final class Sim {
         if (threshold == 0) {
             return;
         }
-        long applied = node.stateMachine.appliedIndex();
+        long applied = node.lastAppliedIndex;
         if (applied == 0 || applied - node.snapshotMeta.getLastIndex() < threshold) {
             return;
         }
-        // Only snapshot what the state machine has actually applied, and only at an index whose term
-        // is known.
+        // The boundary index and its term come from the same applied entry. A snapshot that
+        // misdescribes its own boundary makes a receiver discard entries it has acknowledged.
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         node.stateMachine.snapshot(out);
         SnapshotMetadata meta =
@@ -287,6 +297,7 @@ public final class Sim {
         node.store.installSnapshot(meta);
         node.snapshotMeta = meta;
         node.snapshotPayload = payload;
+        node.lastAppliedIndex = meta.getLastIndex();
         node.lastAppliedTerm = meta.getLastTerm();
         // The pre-snapshot applied list is not a record of this node's state any more: the snapshot
         // replaced it wholesale. Invariants compare by log index, so the shorter list is fine.
@@ -356,7 +367,11 @@ public final class Sim {
         // it. Without this the node would replay from index 1 into a log whose prefix is gone.
         if (node.snapshotMeta.getLastIndex() > 0) {
             node.stateMachine.restore(new ByteArrayInputStream(node.snapshotPayload));
+            node.lastAppliedIndex = node.snapshotMeta.getLastIndex();
             node.lastAppliedTerm = node.snapshotMeta.getLastTerm();
+        } else {
+            node.lastAppliedIndex = 0;
+            node.lastAppliedTerm = 0;
         }
         network.forget(id);
         crashes++;

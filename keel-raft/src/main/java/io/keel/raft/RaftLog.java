@@ -370,6 +370,18 @@ final class RaftLog {
         pendingSnapshot = null;
     }
 
+    /**
+     * Highest index the driver has confirmed durable.
+     *
+     * <p>Everything below the in-memory tail is in storage, so this is where the tail begins minus
+     * one. A leader must count <em>this</em> rather than {@link #lastIndex()} toward a quorum: an
+     * entry it has appended but not yet synced can vanish in a crash, and counting it can commit an
+     * entry that then survives on fewer than a majority.
+     */
+    long persistedIndex() {
+        return unstableOffset() - 1;
+    }
+
     /** Entries the driver has not persisted yet. */
     List<Entry> unstableEntries() {
         return List.copyOf(unstable);

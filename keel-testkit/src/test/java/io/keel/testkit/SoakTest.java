@@ -46,17 +46,38 @@ class SoakTest {
             Sim sim = Sim.of(config);
 
             int written = 0;
-            for (int i = 0; i < TICKS_PER_SEED; i++) {
-                if (i % 4 == 0) {
-                    long index =
-                            sim.propose(
-                                    Commands.put(
-                                            Commands.NO_SESSION, "k" + (written % 32), "v" + written));
-                    if (index > 0) {
-                        written++;
+            try {
+                for (int i = 0; i < TICKS_PER_SEED; i++) {
+                    if (i % 4 == 0) {
+                        long index =
+                                sim.propose(
+                                        Commands.put(
+                                                Commands.NO_SESSION, "k" + (written % 32), "v" + written));
+                        if (index > 0) {
+                            written++;
+                        }
                     }
+                    sim.step();
                 }
-                sim.step();
+            } catch (RuntimeException e) {
+                // An InvariantViolation already carries its seed. Anything else does not, and a
+                // failure a sweep cannot name is a failure nobody can reproduce. That includes the
+                // core's own assertions, which are exactly the interesting ones.
+                if (e instanceof InvariantViolation) {
+                    throw e;
+                }
+                throw new IllegalStateException(
+                        "seed "
+                                + seed
+                                + " ("
+                                + (seed % 2 == 0 ? "chaotic" : "brutal")
+                                + ") failed at tick "
+                                + sim.tick()
+                                + ": "
+                                + e
+                                + "\n"
+                                + sim.describe(),
+                        e);
             }
 
             Sim.SimStats stats = sim.stats();

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.keel.proto.log.Entry;
 import io.keel.proto.log.HardState;
+import io.keel.proto.log.SnapshotMetadata;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -176,5 +177,40 @@ class MemoryLogStoreTest {
 
     private static byte[] data(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
+    }
+
+    @Test
+    @DisplayName("compacting with a term that misdescribes the boundary is rejected")
+    void compactionMetadataMustMatchTheLog() {
+        // The bug behind seed 2626, caught here rather than five hundred ticks later. A driver built
+        // the metadata from two places: the boundary index from its state machine, which only sees
+        // client commands, and the term from the last entry it applied of any kind. Across a term
+        // change those describe different entries, and the snapshot then claims a term its own
+        // boundary does not have.
+        //
+        // A receiver compares that term against its own entry at the boundary to decide whether it may
+        // keep the entries above it. A wrong term makes the comparison fail, so the receiver discards
+        // entries it has already acknowledged while the leader still counts them. Failing at the point
+        // the metadata is built keeps the mistake next to its cause.
+        MemoryLogStore store = new MemoryLogStore();
+        store.append(
+                List.of(
+                        Entries.normal(1, 1, data("a")),
+                        Entries.normal(2, 1, data("b")),
+                        Entries.normal(3, 2, data("c"))));
+
+        IllegalArgumentException e =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                store.compact(
+                                        SnapshotMetadata.newBuilder().setLastIndex(2).setLastTerm(2).build()));
+        assertTrue(e.getMessage().contains("holds term 1"), e.getMessage());
+        assertEquals(3, store.lastIndex(), "a rejected compaction must not have moved anything");
+        assertEquals(1, store.firstIndex());
+
+        // The same boundary with its real term is accepted.
+        store.compact(SnapshotMetadata.newBuilder().setLastIndex(2).setLastTerm(1).build());
+        assertEquals(3, store.firstIndex());
     }
 }
