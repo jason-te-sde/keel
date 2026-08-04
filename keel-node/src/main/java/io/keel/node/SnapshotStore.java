@@ -147,16 +147,6 @@ final class SnapshotStore {
     }
 
     /**
-     * Writes a received snapshot by streaming, checksumming as the bytes arrive.
-     *
-     * <p>Nothing larger than the caller's buffer is held in memory, which is the point: a state
-     * machine bigger than the heap used to be impossible to send or receive, for a reason that had
-     * nothing to do with consensus.
-     *
-     * <p>The checksum is computed over what actually arrived and compared with what was promised, so a
-     * truncated or corrupted transfer is rejected rather than installed.
-     */
-    /**
      * Starts receiving a snapshot, written straight to disk as chunks arrive.
      *
      * <p>Nothing larger than one chunk is ever in memory. Buffering a whole snapshot capped the
