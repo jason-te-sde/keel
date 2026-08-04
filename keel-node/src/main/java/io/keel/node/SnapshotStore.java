@@ -89,7 +89,33 @@ final class SnapshotStore {
     }
 
     /**
-     * Reads a snapshot's payload, verifying its checksum.
+     * Opens a snapshot's payload for streaming, positioned after the metadata header.
+     *
+     * <p>The checksum cannot be verified up front without reading the whole payload, which is the
+     * thing this method exists to avoid. Verification is the sender's job over the wire and the
+     * receiver's job on arrival: the receiver has to checksum what it actually received anyway, so
+     * checking here as well would read every byte twice to catch nothing new.
+     */
+    InputStream open(Stored stored) {
+        try {
+            InputStream in = Files.newInputStream(stored.file());
+            // Consume the delimited header so the caller sees payload from its first byte.
+            SnapshotMetadata header = SnapshotMetadata.parseDelimitedFrom(in);
+            if (header == null) {
+                in.close();
+                throw new IllegalStateException("snapshot " + stored.file() + " has no metadata");
+            }
+            return in;
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to open " + stored.file(), e);
+        }
+    }
+
+    /**
+     * Reads a snapshot's payload whole, verifying its checksum.
+     *
+     * <p>Used on startup, where the state machine is being restored and the payload has to be in
+     * memory regardless. Transfers use {@link #open} instead.
      *
      * @throws IllegalStateException if the bytes do not match the metadata, which means the file was
      *     damaged after it was written
@@ -118,6 +144,149 @@ final class SnapshotStore {
         } catch (IOException e) {
             throw new UncheckedIOException("failed to read " + stored.file(), e);
         }
+    }
+
+    /**
+     * Writes a received snapshot by streaming, checksumming as the bytes arrive.
+     *
+     * <p>Nothing larger than the caller's buffer is held in memory, which is the point: a state
+     * machine bigger than the heap used to be impossible to send or receive, for a reason that had
+     * nothing to do with consensus.
+     *
+     * <p>The checksum is computed over what actually arrived and compared with what was promised, so a
+     * truncated or corrupted transfer is rejected rather than installed.
+     */
+    /**
+     * Starts receiving a snapshot, written straight to disk as chunks arrive.
+     *
+     * <p>Nothing larger than one chunk is ever in memory. Buffering a whole snapshot capped the
+     * store's practical size at the heap, for a reason that had nothing to do with consensus.
+     */
+    Incoming receive(SnapshotMetadata promised) {
+        return new Incoming(promised);
+    }
+
+    /**
+     * A snapshot being written as it arrives.
+     *
+     * <p>Size and checksum are only known once everything has arrived, and the header has to sit in
+     * front of the payload, so the body lands in a scratch file and the header is prepended at the
+     * end. Two files on disk rather than one array in memory is the whole point.
+     */
+    final class Incoming implements AutoCloseable {
+
+        private final SnapshotMetadata promised;
+        private final Path scratch;
+        private final CRC32C crc = new CRC32C();
+        private final OutputStream body;
+        private long size;
+        private boolean finished;
+
+        private Incoming(SnapshotMetadata promised) {
+            this.promised = promised;
+            this.scratch = directory.resolve(fileName(promised) + ".body");
+            try {
+                this.body =
+                        Files.newOutputStream(
+                                scratch, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            } catch (IOException e) {
+                throw new UncheckedIOException("failed to open " + scratch, e);
+            }
+        }
+
+        void write(byte[] chunk, int length) {
+            try {
+                crc.update(chunk, 0, length);
+                size += length;
+                body.write(chunk, 0, length);
+            } catch (IOException e) {
+                throw new UncheckedIOException("failed to write a snapshot chunk", e);
+            }
+        }
+
+        /**
+         * Verifies what arrived against what was promised, then promotes the file.
+         *
+         * @throws IllegalStateException if the size or checksum disagree, so a truncated or corrupted
+         *     transfer is rejected rather than installed
+         */
+        SnapshotMetadata finish() {
+            Path temp = directory.resolve(fileName(promised) + ".tmp");
+            try {
+                body.close();
+                if (promised.getSizeBytes() != 0 && size != promised.getSizeBytes()) {
+                    throw new IllegalStateException(
+                            "received "
+                                    + size
+                                    + " bytes for a snapshot that promised "
+                                    + promised.getSizeBytes());
+                }
+                if (promised.getChecksum() != 0 && crc.getValue() != promised.getChecksum()) {
+                    throw new IllegalStateException("received snapshot failed its checksum");
+                }
+                SnapshotMetadata complete =
+                        promised.toBuilder().setSizeBytes(size).setChecksum(crc.getValue()).build();
+                try (OutputStream out =
+                                Files.newOutputStream(
+                                        temp,
+                                        StandardOpenOption.CREATE,
+                                        StandardOpenOption.TRUNCATE_EXISTING);
+                        InputStream in = Files.newInputStream(scratch)) {
+                    complete.writeDelimitedTo(out);
+                    in.transferTo(out);
+                }
+                syncAndPromote(temp, complete);
+                finished = true;
+                return complete;
+            } catch (IOException e) {
+                throw new UncheckedIOException("failed to store a received snapshot", e);
+            } finally {
+                deleteQuietly(scratch);
+                if (!finished) {
+                    deleteQuietly(temp);
+                }
+            }
+        }
+
+        @Override
+        public void close() {
+            if (finished) {
+                return;
+            }
+            // An abandoned transfer leaves nothing behind. A half-written snapshot that survived would
+            // be indistinguishable from a good one, and the log gets compacted on the strength of it.
+            try {
+                body.close();
+            } catch (IOException e) {
+                LOG.debug("could not close {}: {}", scratch, e.getMessage());
+            }
+            deleteQuietly(scratch);
+        }
+    }
+
+    private void deleteQuietly(Path path) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException e) {
+            // A leftover temporary file costs disk and nothing else; the next transfer truncates it.
+            LOG.debug("could not delete {}: {}", path, e.getMessage());
+        }
+    }
+
+    private void syncAndPromote(Path temp, SnapshotMetadata complete) {
+        syncFile(temp);
+        Path target = directory.resolve(fileName(complete));
+        try {
+            Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to promote " + temp, e);
+        }
+        syncDirectory();
+        LOG.info(
+                "stored a snapshot at index {} ({} bytes)",
+                complete.getLastIndex(),
+                complete.getSizeBytes());
+        prune();
     }
 
     /** Stores a snapshot received from a leader, after checking it against the promised metadata. */
