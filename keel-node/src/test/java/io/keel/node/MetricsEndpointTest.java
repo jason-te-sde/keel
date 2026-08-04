@@ -19,6 +19,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -81,14 +82,52 @@ class MetricsEndpointTest {
     @DisplayName("a follower reports the leader and its own lag")
     void followerMetrics() {
         startCluster(3);
-        long leader = leaderId();
-        long follower = nodes.stream().map(KeelNode::nodeId).filter(id -> id != leader).findFirst().orElseThrow();
 
-        String body = get(node(follower).metricsPort(), "/metrics").body();
+        // One scrape of a live cluster is a race. Heartbeats arrive late on a loaded machine, and a
+        // follower that has just started its own election is telling the truth when it reports itself
+        // a candidate with no leader. Asserting on a single scrape made this the flakiest test in the
+        // suite: it was the sole failure on most of the dependency bumps sitting in review, which made
+        // every one of them look like a real regression.
+        //
+        // Waiting for one internally consistent scrape keeps the assertions about what a follower
+        // reports rather than about how quickly the cluster happens to settle.
+        String body = followerScrape();
 
         assertTrue(body.contains("keel_raft_role{role=\"follower\"} 1"), body);
-        assertEquals(leader, parse(body, "keel_raft_leader_id"));
-        assertTrue(parse(body, "keel_raft_apply_lag_entries") >= 0);
+        assertEquals(leaderId(), parse(body, "keel_raft_leader_id"), body);
+        assertTrue(parse(body, "keel_raft_apply_lag_entries") >= 0, body);
+    }
+
+    /**
+     * Scrapes a follower until one response describes a follower that names the same leader the cluster
+     * does, and returns that body.
+     *
+     * <p>The leader is re-read on every attempt on purpose. A leader change during the wait is normal
+     * behaviour, not a reason to fail, so the condition is about a single response being self
+     * consistent rather than about the cluster matching what it looked like when the test started.
+     */
+    private String followerScrape() {
+        StringBuilder last = new StringBuilder("no scrape completed");
+        await(
+                () -> {
+                    long leader = leaderIdOrZero();
+                    if (leader == 0) {
+                        return false;
+                    }
+                    long follower =
+                            nodes.stream()
+                                    .map(KeelNode::nodeId)
+                                    .filter(id -> id != leader)
+                                    .findFirst()
+                                    .orElseThrow();
+                    String body = get(node(follower).metricsPort(), "/metrics").body();
+                    last.setLength(0);
+                    last.append(body);
+                    return body.contains("keel_raft_role{role=\"follower\"} 1")
+                            && parse(body, "keel_raft_leader_id") == leader;
+                },
+                () -> "a follower that agrees with the cluster about the leader; last scrape was:\n" + last);
+        return last.toString();
     }
 
     @Test
@@ -242,6 +281,16 @@ class MetricsEndpointTest {
     }
 
     private void await(BooleanSupplier condition, String what) {
+        await(condition, () -> what);
+    }
+
+    /**
+     * Same, with the description built only if the wait fails.
+     *
+     * <p>Worth the overload because the useful description here is the last response received, which
+     * does not exist yet when the wait starts.
+     */
+    private void await(BooleanSupplier condition, Supplier<String> what) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
         while (System.nanoTime() < deadline) {
             if (condition.getAsBoolean()) {
@@ -251,10 +300,10 @@ class MetricsEndpointTest {
                 Thread.sleep(25);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                fail("interrupted waiting for " + what);
+                fail("interrupted waiting for " + what.get());
             }
         }
-        fail("timed out waiting for " + what);
+        fail("timed out waiting for " + what.get());
     }
 
     private static List<Integer> freePorts(int count) {

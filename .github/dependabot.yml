@@ -18,12 +18,25 @@ updates:
         patterns:
           - "org.apache.maven.plugins:*"
           - "org.jacoco:*"
+      # log4j-slf4j2-impl pins the slf4j-api it was built against, so raising log4j alone leaves
+      # keel-node with two versions of slf4j-api and requireUpperBoundDeps rejects the build. The
+      # two have to move together or neither can move at all.
+      logging:
+        patterns:
+          - "org.slf4j:*"
+          - "org.apache.logging.log4j:*"
     commit-message:
       prefix: "chore(deps)"
 
+  # One pull request for all of them. Five separate bumps of first-party actions are five reviews
+  # of the same decision, and each one has to re-run the whole matrix to say the same thing.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: monthly
+    groups:
+      actions:
+        patterns:
+          - "*"
     commit-message:
       prefix: "ci(deps)"

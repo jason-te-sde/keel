@@ -16,6 +16,9 @@ jobs:
   build:
     name: build (jdk ${{ matrix.java }})
     runs-on: ubuntu-latest
+    # The whole job takes about a minute. Anything approaching this is hung, and the six hour default
+    # means a hung job holds a runner for an afternoon before anyone notices.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -34,9 +37,21 @@ jobs:
       - name: verify
         run: mvn -B -ntp verify
 
+      # Surefire already writes the failing assertion and its stack trace to disk. Without this they
+      # are deleted when the job ends, and the summary says only that Maven exited non-zero, so
+      # diagnosing a red run means downloading the raw log and grepping it.
+      - name: test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-jdk${{ matrix.java }}
+          path: '**/target/surefire-reports/**'
+          retention-days: 7
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -57,6 +72,13 @@ jobs:
           name: jacoco
           path: '**/target/site/jacoco/**'
           retention-days: 7
+      - name: test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-coverage
+          path: '**/target/surefire-reports/**'
+          retention-days: 7
 
   # The container story is claimed in the README and the operations guide, so it is checked rather
   # than asserted. This job builds the image and brings up the real three-node compose stack,
@@ -68,8 +90,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: docker/setup-buildx-action@v3
+
+      # Cached across runs because the image is a multi stage build whose first stage resolves the
+      # whole Maven dependency tree. Without a cache that download is repeated on every pull request
+      # and is most of the job's wall time.
       - name: build the image
-        run: docker build -t keel:ci .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: keel:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       # --wait blocks until every service reports healthy, which is the Dockerfile's own /readyz
       # check. If a node cannot serve a read, this fails here instead of in the next step.
@@ -91,13 +124,24 @@ jobs:
 
       - name: kill the leader and read the value back
         run: |
-          leader=$(docker compose run --rm keelctl status | awk '/LEADER/ {print $2}' | head -1)
+          leader=$(scripts/leader-of.sh 1 2 3)
           echo "killing node $leader"
           docker kill "keel-$leader"
+
+          # Wait for one of the survivors to win the election. Asking the survivors specifically
+          # matters: the killed node's metrics port is gone, and a connection refused there is the
+          # expected outcome rather than a failure to report.
+          survivors=$(for n in 1 2 3; do [ "$n" = "$leader" ] || printf '%s ' "$n"; done)
           for i in $(seq 1 30); do
-            if docker compose run --rm keelctl status | grep -q LEADER; then break; fi
+            # shellcheck disable=SC2086
+            if new_leader=$(scripts/leader-of.sh $survivors); then
+              echo "node $new_leader took over after $i attempts"
+              break
+            fi
             sleep 2
           done
+          test -n "${new_leader:-}"
+
           value=$(docker compose run --rm keelctl get greeting | tr -d '\r\n')
           test "$value" = "hello"
 
@@ -126,6 +170,7 @@ jobs:
   clean-clone:
     name: clean clone builds
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
