@@ -31,6 +31,23 @@ class ReplicationTest {
     }
 
     @Test
+    @DisplayName("a single-node cluster commits its own writes")
+    void singleNodeCommitsWithoutReplies() {
+        // A lone voter is its own majority, so nothing ever replies to it. maybeCommit used to run
+        // only when a reply arrived, which meant a one-node cluster committed its election no-op and
+        // then nothing else, forever. Found by writing a backup test against a single node.
+        TestCluster c = TestCluster.of(1).start();
+        c.node(1).campaign();
+        c.settle();
+
+        c.node(1).propose(bytes("alone"));
+        c.settle();
+
+        assertEquals(2, c.node(1).commitIndex(), "the no-op and the write should both be committed");
+        assertEquals(List.of("alone"), c.appliedCommands(1));
+    }
+
+    @Test
     @DisplayName("a write offered to a follower is refused with a hint")
     void followerRefusesWrites() {
         TestCluster c = TestCluster.of(3).start();

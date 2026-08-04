@@ -52,7 +52,7 @@ public final class Keelctl {
 
         Map<Long, String> cluster;
         try {
-            cluster = Keeld.Flags.parseCluster(flags.get("cluster"));
+            cluster = NodeConfig.parseCluster(flags.get("cluster"));
         } catch (RuntimeException e) {
             err.println("error: " + rootCause(e));
             return 2;

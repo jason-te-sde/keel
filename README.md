@@ -33,6 +33,13 @@ Three things make it worth a read:
 ## Try it
 
 ```bash
+docker compose up -d --wait                    # three nodes, health-checked
+docker compose run --rm keelctl status
+```
+
+or without containers:
+
+```bash
 mvn package -DskipTests
 ./scripts/local-cluster.sh          # three nodes on 9001-9003
 ```
@@ -60,8 +67,12 @@ $ keelctl --cluster=$CLUSTER member add 4=127.0.0.1:9004
 voters: [1, 2, 3, 4]                     # a fourth node joins a running cluster
 ```
 
-Requires JDK 21+ and Maven 3.9+. Nothing else — `protoc` and the gRPC generator are fetched by the
+Requires JDK 21+ and Maven 3.9+, or just Docker. `protoc` and the gRPC generator are fetched by the
 build.
+
+**Before putting it anywhere real:** a node refuses to listen on a non-loopback address without TLS
+and a client token, unless `--insecure` is passed. [`docs/operations.md`](docs/operations.md) covers
+the flags, what to monitor, disk sizing, backup and restore, and upgrades.
 
 ## Use it as a library
 
@@ -304,6 +315,7 @@ Ten minutes, in this order:
 | --- | --- |
 | [`docs/architecture.md`](docs/architecture.md) | layering, threads, and where the durability boundary is |
 | [`docs/testing.md`](docs/testing.md) | what each layer proves, and the known gaps |
+| [`docs/operations.md`](docs/operations.md) | running it: tuning, monitoring, sizing, backup, upgrades |
 | [`docs/design/`](docs/design/) | one note per decision, each with its costs and rejected alternatives |
 
 ## Layout

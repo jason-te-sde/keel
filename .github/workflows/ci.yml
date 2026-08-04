@@ -58,6 +58,57 @@ jobs:
           path: '**/target/site/jacoco/**'
           retention-days: 7
 
+  # The container story is claimed in the README and the operations guide, so it is checked rather
+  # than asserted. This job builds the image and brings up the real three-node compose stack,
+  # because a Dockerfile that has never been built is documentation of an intention.
+  container:
+    name: container stack works
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build the image
+        run: docker build -t keel:ci .
+
+      # --wait blocks until every service reports healthy, which is the Dockerfile's own /readyz
+      # check. If a node cannot serve a read, this fails here instead of in the next step.
+      - name: bring up three nodes
+        run: docker compose up -d --wait
+
+      - name: write and read through the cluster
+        run: |
+          docker compose run --rm keelctl status
+          docker compose run --rm keelctl put greeting hello
+          value=$(docker compose run --rm keelctl get greeting | tr -d '\r\n')
+          echo "read back: '$value'"
+          test "$value" = "hello"
+
+      - name: metrics endpoint is scrapeable
+        run: |
+          curl -sf http://127.0.0.1:9101/metrics | grep -q 'keel_raft_role{role="leader"}'
+          curl -sf http://127.0.0.1:9101/readyz
+
+      - name: kill the leader and read the value back
+        run: |
+          leader=$(docker compose run --rm keelctl status | awk '/LEADER/ {print $2}' | head -1)
+          echo "killing node $leader"
+          docker kill "keel-$leader"
+          for i in $(seq 1 30); do
+            if docker compose run --rm keelctl status | grep -q LEADER; then break; fi
+            sleep 2
+          done
+          value=$(docker compose run --rm keelctl get greeting | tr -d '\r\n')
+          test "$value" = "hello"
+
+      - name: logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=200
+
+      - name: tear down
+        if: always()
+        run: docker compose down -v
+
   # A clean clone must build with nothing but a JDK and Maven. An earlier
   # project of mine declared a module that was never committed, which meant the
   # published repository could not be built at all; this job is the guard.
