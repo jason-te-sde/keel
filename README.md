@@ -63,6 +63,33 @@ voters: [1, 2, 3, 4]                     # a fourth node joins a running cluster
 Requires JDK 21+ and Maven 3.9+. Nothing else — `protoc` and the gRPC generator are fetched by the
 build.
 
+## Use it as a library
+
+The consensus core has no I/O, no threads, and no dependencies beyond the schema module, so it can
+be driven by something other than this server. That is the module most people would want.
+
+```xml
+<dependency>
+  <groupId>io.github.jason-te-sde</groupId>
+  <artifactId>keel-raft</artifactId>
+  <version>0.3.0</version>
+</dependency>
+```
+
+| Module | What it is for |
+| --- | --- |
+| `keel-raft` | the consensus core, driven by you |
+| `keel-storage` | a crash-recoverable write-ahead log implementing the core's storage port |
+| `keel-kv` | the key-value state machine and client sessions |
+| `keel-testkit` | the simulator and linearizability checker, usable against your own state machine |
+| `keel-node` | the whole server, if you want it rather than the pieces |
+
+**Not on Maven Central yet.** Publishing needs a Sonatype account and a signing key that cannot
+live in the repository; [`RELEASING.md`](RELEASING.md) has the sequence. Until then, `mvn install`
+puts the modules in your local repository, and each release has the runnable jar attached.
+
+API documentation: **[jason-te-sde.github.io/keel](https://jason-te-sde.github.io/keel/)**
+
 ## Architecture
 
 ```mermaid

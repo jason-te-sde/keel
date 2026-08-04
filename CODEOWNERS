@@ -1,0 +1,8 @@
+# Everything, by default.
+*                       @jason-te-sde
+
+# The consensus core and the storage format are where a subtle change does the most damage.
+# These paths are called out so a future contributor knows review will be slower here, and why.
+/keel-raft/             @jason-te-sde
+/keel-storage/          @jason-te-sde
+/keel-proto/            @jason-te-sde

@@ -5,9 +5,9 @@
   <modelVersion>4.0.0</modelVersion>
 
   <parent>
-    <groupId>io.keel</groupId>
+    <groupId>io.github.jason-te-sde</groupId>
     <artifactId>keel-parent</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.3.0-SNAPSHOT</version>
   </parent>
 
   <artifactId>keel-storage</artifactId>
@@ -19,11 +19,11 @@
 
   <dependencies>
     <dependency>
-      <groupId>io.keel</groupId>
+      <groupId>io.github.jason-te-sde</groupId>
       <artifactId>keel-raft</artifactId>
     </dependency>
     <dependency>
-      <groupId>io.keel</groupId>
+      <groupId>io.github.jason-te-sde</groupId>
       <artifactId>keel-proto</artifactId>
     </dependency>
     <dependency>

@@ -1,0 +1,45 @@
+name: Release artifacts
+
+# A tag should produce something downloadable. Before this, the releases page had notes and no
+# artifacts, so the only way to get a build was to clone and compile.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # Tests have already run on the commit this tag points at, but a release artifact that was
+      # never tested is not worth the bytes.
+      - name: verify
+        run: mvn -B -ntp verify
+
+      - name: build release artifacts
+        run: mvn -B -ntp -Prelease package -DskipTests
+
+      - name: name the runnable jar after the tag
+        run: |
+          mkdir -p dist
+          cp keel-node/target/keel.jar "dist/keel-${GITHUB_REF_NAME}.jar"
+          (cd dist && sha256sum "keel-${GITHUB_REF_NAME}.jar" > "keel-${GITHUB_REF_NAME}.jar.sha256")
+
+      - name: attach to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The release may not exist yet if the tag was pushed first; create it if so.
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
