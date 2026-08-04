@@ -107,7 +107,14 @@ jobs:
         if: always()
         run: |
           docker compose ps
-          docker compose logs --no-color --tail=100
+          echo "--- health ---"
+          for n in keel-1 keel-2 keel-3; do
+            echo "$n: $(docker inspect --format '{{json .State.Health}}' $n 2>/dev/null | head -c 600)"
+          done
+          echo "--- readyz from the host ---"
+          curl -sS -o - -w '\nHTTP %{http_code}\n' http://127.0.0.1:9101/readyz || true
+          echo "--- logs ---"
+          docker compose logs --no-color --tail=120
 
       - name: tear down
         if: always()
