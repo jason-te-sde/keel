@@ -59,7 +59,14 @@ public final class Keelctl {
         }
 
         String command = positional.get(0);
-        try (KeelClient client = new KeelClient(cluster)) {
+        SecurityOptions security;
+        try {
+            security = securityFrom(flags);
+        } catch (RuntimeException e) {
+            err.println("error: " + rootCause(e));
+            return 2;
+        }
+        try (KeelClient client = new KeelClient(cluster, security, 5_000)) {
             return switch (command) {
                 case "get" -> get(client, positional, flags, out, err);
                 case "put" -> put(client, positional, out, err);
@@ -187,6 +194,17 @@ public final class Keelctl {
         return 0;
     }
 
+    private static SecurityOptions securityFrom(Map<String, String> flags) {
+        java.nio.file.Path cert =
+                flags.containsKey("tls-cert") ? java.nio.file.Path.of(flags.get("tls-cert")) : null;
+        java.nio.file.Path key =
+                flags.containsKey("tls-key") ? java.nio.file.Path.of(flags.get("tls-key")) : null;
+        java.nio.file.Path ca =
+                flags.containsKey("tls-ca") ? java.nio.file.Path.of(flags.get("tls-ca")) : null;
+        return new SecurityOptions(
+                cert, key, ca, flags.get("token"), flags.get("admin-token"), true);
+    }
+
     private static String rootCause(Throwable e) {
         Throwable cause = e;
         while (cause.getCause() != null) {
@@ -202,6 +220,11 @@ public final class Keelctl {
 
                   --cluster=ID=HOST:PORT,...   cluster to talk to (required)
                   --stale                      read local state without a read index
+                  --tls-cert=PATH              PEM client certificate
+                  --tls-key=PATH               PEM client private key
+                  --tls-ca=PATH                PEM CA to verify the server against
+                  --token=TOKEN                client token
+                  --admin-token=TOKEN          token for member add and member remove
 
                 commands:
                   get KEY                      read a key

@@ -39,6 +39,7 @@ public final class Keeld {
         if (flags.containsKey("rocksdb")) {
             options = options.withRocksDb(Path.of(flags.get("rocksdb")));
         }
+        options = options.withSecurity(securityFrom(flags));
 
         KeelNode node = KeelNode.open(options).start();
         Runtime.getRuntime()
@@ -59,6 +60,19 @@ public final class Keeld {
         }
     }
 
+    private static SecurityOptions securityFrom(Map<String, String> flags) {
+        Path cert = flags.containsKey("tls-cert") ? Path.of(flags.get("tls-cert")) : null;
+        Path key = flags.containsKey("tls-key") ? Path.of(flags.get("tls-key")) : null;
+        Path ca = flags.containsKey("tls-ca") ? Path.of(flags.get("tls-ca")) : null;
+        return new SecurityOptions(
+                cert,
+                key,
+                ca,
+                flags.get("client-token"),
+                flags.get("admin-token"),
+                flags.containsKey("insecure"));
+    }
+
     private static void usage() {
         System.out.println(
                 """
@@ -70,6 +84,15 @@ public final class Keeld {
                   --data-dir=PATH        where the log lives (default data/<id>)
                   --rocksdb=PATH         keep state in RocksDB instead of on the heap
                   --tick-ms=N            logical tick in milliseconds (default 50)
+
+                security (required to listen on anything but loopback):
+                  --tls-cert=PATH        PEM certificate chain this node presents
+                  --tls-key=PATH         PEM private key
+                  --tls-ca=PATH          PEM CA that peers and clients are verified against
+                  --client-token=TOKEN   required on client calls
+                  --admin-token=TOKEN    required for membership changes; without it, membership
+                                         changes fall back to the client token
+                  --insecure             allow a non-loopback address with no TLS and no token
 
                 example:
                   keeld --id=1 --cluster=1=127.0.0.1:9001,2=127.0.0.1:9002,3=127.0.0.1:9003 \\

@@ -2,7 +2,11 @@ package io.keel.node;
 
 import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
+import io.grpc.Metadata;
+import io.grpc.netty.shaded.io.grpc.netty.GrpcSslContexts;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
+import io.grpc.netty.shaded.io.netty.handler.ssl.SslContext;
+import io.grpc.stub.MetadataUtils;
 import io.keel.proto.kv.Session;
 import io.keel.proto.service.AddMemberRequest;
 import io.keel.proto.service.CasRequest;
@@ -26,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import javax.net.ssl.SSLException;
 import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -57,16 +62,40 @@ public final class KeelClient implements AutoCloseable {
 
     /** Connects to every node in {@code cluster}, mapping node id to {@code host:port}. */
     public KeelClient(Map<Long, String> cluster) {
-        this(cluster, 5_000);
+        this(cluster, SecurityOptions.none(), 5_000);
     }
 
     public KeelClient(Map<Long, String> cluster, long deadlineMillis) {
+        this(cluster, SecurityOptions.none(), deadlineMillis);
+    }
+
+    /**
+     * Connects with TLS and tokens.
+     *
+     * <p>{@link SecurityOptions#insecure()} is ignored here: it governs what a server is willing to
+     * bind, not what a client is willing to dial.
+     */
+    public KeelClient(Map<Long, String> cluster, SecurityOptions security, long deadlineMillis) {
         this.deadlineMillis = deadlineMillis;
+        // Both tokens travel on every call. The server checks whichever one the method requires, and
+        // deciding that here would mean the client encoding the server's authorisation rules.
+        Metadata headers = new Metadata();
+        if (security.clientToken() != null) {
+            headers.put(AuthInterceptor.TOKEN, security.clientToken());
+        }
+        if (security.adminToken() != null) {
+            headers.put(AuthInterceptor.ADMIN_TOKEN, security.adminToken());
+        }
+
         cluster.forEach(
                 (id, address) -> {
-                    ManagedChannel channel = NettyChannelBuilder.forTarget(address).usePlaintext().build();
+                    ManagedChannel channel = channelTo(address, security);
                     channels.put(id, channel);
-                    stubs.put(id, KvServiceGrpc.newBlockingStub(channel));
+                    KvServiceGrpc.KvServiceBlockingStub stub = KvServiceGrpc.newBlockingStub(channel);
+                    if (headers.keys().size() > 0) {
+                        stub = stub.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers));
+                    }
+                    stubs.put(id, stub);
                 });
         this.nodeIds = new ArrayList<>(stubs.keySet());
         this.preferred = nodeIds.isEmpty() ? 0 : nodeIds.get(0);
@@ -82,6 +111,22 @@ public final class KeelClient implements AutoCloseable {
         sequence = 0;
         LOG.debug("opened session {}", clientId);
         return clientId;
+    }
+
+    private static ManagedChannel channelTo(String address, SecurityOptions security) {
+        if (!security.tlsEnabled()) {
+            return NettyChannelBuilder.forTarget(address).usePlaintext().build();
+        }
+        try {
+            SslContext ssl =
+                    GrpcSslContexts.forClient()
+                            .keyManager(security.certificate().toFile(), security.privateKey().toFile())
+                            .trustManager(security.trustedCa().toFile())
+                            .build();
+            return NettyChannelBuilder.forTarget(address).sslContext(ssl).build();
+        } catch (SSLException e) {
+            throw new IllegalStateException("failed to build a TLS channel to " + address, e);
+        }
     }
 
     public void put(String key, String value) {
@@ -223,6 +268,15 @@ public final class KeelClient implements AutoCloseable {
                             throw new IllegalStateException(
                                     header.getCode() + ": " + header.getMessage());
                 }
+            } catch (io.grpc.StatusRuntimeException e) {
+                if (e.getStatus().getCode() == io.grpc.Status.Code.UNAUTHENTICATED
+                        || e.getStatus().getCode() == io.grpc.Status.Code.PERMISSION_DENIED) {
+                    // A bad credential is not a transient failure. Trying every other node with the
+                    // same token would turn one clear error into a dozen confusing ones.
+                    throw new IllegalStateException("authentication failed: " + e.getStatus().getDescription(), e);
+                }
+                preferred = 0;
+                last = e;
             } catch (RuntimeException e) {
                 // Unreachable node: try another one.
                 preferred = 0;
