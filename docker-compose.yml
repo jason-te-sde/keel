@@ -1,0 +1,73 @@
+# A three-node cluster. One command, and it behaves like a real deployment rather than a demo:
+# separate volumes, separate metrics ports, and health checks an orchestrator would use.
+#
+#   docker compose up --build
+#   docker compose run --rm keelctl status
+#
+# Insecure on purpose, and only on this private network. See docs/operations.md for the TLS and
+# token flags a real deployment needs; a node refuses to listen on anything but loopback without
+# them unless --insecure is passed, which is what these nodes do.
+
+name: keel
+
+x-node: &node
+  build: .
+  restart: unless-stopped
+  networks: [keel]
+
+services:
+  keel-1:
+    <<: *node
+    container_name: keel-1
+    volumes: ["keel-1-data:/var/lib/keel"]
+    ports: ["9001:9001", "9101:9101"]
+    command:
+      - --id=1
+      - --cluster=1=keel-1:9001,2=keel-2:9001,3=keel-3:9001
+      - --data-dir=/var/lib/keel
+      - --metrics-port=9101
+      - --insecure
+
+  keel-2:
+    <<: *node
+    container_name: keel-2
+    volumes: ["keel-2-data:/var/lib/keel"]
+    ports: ["9002:9001", "9102:9101"]
+    command:
+      - --id=2
+      - --cluster=1=keel-1:9001,2=keel-2:9001,3=keel-3:9001
+      - --data-dir=/var/lib/keel
+      - --metrics-port=9101
+      - --insecure
+
+  keel-3:
+    <<: *node
+    container_name: keel-3
+    volumes: ["keel-3-data:/var/lib/keel"]
+    ports: ["9003:9001", "9103:9101"]
+    command:
+      - --id=3
+      - --cluster=1=keel-1:9001,2=keel-2:9001,3=keel-3:9001
+      - --data-dir=/var/lib/keel
+      - --metrics-port=9101
+      - --insecure
+
+  # Not a server. `docker compose run --rm keelctl status` runs one command and exits.
+  keelctl:
+    build: .
+    networks: [keel]
+    profiles: [tools]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'exec java -cp /opt/keel/keel.jar io.keel.node.Keelctl --cluster=1=keel-1:9001,2=keel-2:9001,3=keel-3:9001 "$$@"'
+      - --
+    command: ["status"]
+
+networks:
+  keel:
+
+volumes:
+  keel-1-data:
+  keel-2-data:
+  keel-3-data:

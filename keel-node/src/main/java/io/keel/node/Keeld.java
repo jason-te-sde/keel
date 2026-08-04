@@ -23,26 +23,22 @@ public final class Keeld {
 
     public static void main(String[] args) {
         Map<String, String> flags = Flags.parse(args);
-        if (flags.containsKey("help") || !flags.containsKey("id") || !flags.containsKey("cluster")) {
+        if (flags.containsKey("help")) {
             usage();
-            System.exit(flags.containsKey("help") ? 0 : 2);
+            System.exit(0);
         }
 
-        long id = Long.parseLong(flags.get("id"));
-        Map<Long, String> cluster = Flags.parseCluster(flags.get("cluster"));
-        Path dataDir = Path.of(flags.getOrDefault("data-dir", "data/" + id));
-
-        NodeOptions options = NodeOptions.of(id, cluster, dataDir);
-        if (flags.containsKey("tick-ms")) {
-            options = options.withTick(Duration.ofMillis(Long.parseLong(flags.get("tick-ms"))));
+        NodeOptions options;
+        try {
+            options = new NodeConfig(flags).toOptions();
+        } catch (RuntimeException e) {
+            System.err.println("error: " + e.getMessage());
+            usage();
+            System.exit(2);
+            return;
         }
-        if (flags.containsKey("rocksdb")) {
-            options = options.withRocksDb(Path.of(flags.get("rocksdb")));
-        }
-        if (flags.containsKey("metrics-port")) {
-            options = options.withMetricsPort(Integer.parseInt(flags.get("metrics-port")));
-        }
-        options = options.withSecurity(securityFrom(flags));
+        long id = options.nodeId();
+        Map<Long, String> cluster = options.cluster();
 
         KeelNode node = KeelNode.open(options).start();
         Runtime.getRuntime()
@@ -63,24 +59,14 @@ public final class Keeld {
         }
     }
 
-    private static SecurityOptions securityFrom(Map<String, String> flags) {
-        Path cert = flags.containsKey("tls-cert") ? Path.of(flags.get("tls-cert")) : null;
-        Path key = flags.containsKey("tls-key") ? Path.of(flags.get("tls-key")) : null;
-        Path ca = flags.containsKey("tls-ca") ? Path.of(flags.get("tls-ca")) : null;
-        return new SecurityOptions(
-                cert,
-                key,
-                ca,
-                flags.get("client-token"),
-                flags.get("admin-token"),
-                flags.containsKey("insecure"));
-    }
-
     private static void usage() {
         System.out.println(
                 """
                 keeld: run one keel node
 
+                  --config=PATH          properties file; any flag below may live in it instead,
+                                         with dots for hyphens (client.token, tls.cert, ...).
+                                         Flags override the file.
                   --id=N                 this node's id, which must appear in --cluster
                   --cluster=ID=HOST:PORT,...
                                          every voter, including this node
@@ -126,26 +112,5 @@ public final class Keeld {
             return flags;
         }
 
-        static Map<Long, String> parseCluster(String spec) {
-            Map<Long, String> cluster = new LinkedHashMap<>();
-            for (String member : spec.split(",")) {
-                String trimmed = member.trim();
-                if (trimmed.isEmpty()) {
-                    continue;
-                }
-                int equals = trimmed.indexOf('=');
-                if (equals < 0) {
-                    throw new IllegalArgumentException(
-                            "cluster member '" + trimmed + "' should look like ID=HOST:PORT");
-                }
-                cluster.put(
-                        Long.parseLong(trimmed.substring(0, equals).trim()),
-                        trimmed.substring(equals + 1).trim());
-            }
-            if (cluster.isEmpty()) {
-                throw new IllegalArgumentException("cluster is empty");
-            }
-            return cluster;
-        }
     }
 }

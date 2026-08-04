@@ -258,6 +258,10 @@ public final class RaftNode {
         }
         long index = log.lastIndex() + 1;
         log.append(List.of(Entries.normal(index, term, data)));
+        // The leader's own match index just moved, and in a single-voter cluster that is already a
+        // majority. Without this, a one-node cluster commits its election no-op and then nothing
+        // ever again, because maybeCommit only ran on a reply and there is nobody to reply.
+        maybeCommit();
         broadcastAppend();
         return index;
     }
@@ -297,6 +301,7 @@ public final class RaftNode {
         long index = log.lastIndex() + 1;
         log.append(List.of(Entries.confChange(index, term, change.toByteArray())));
         pendingConfIndex = index;
+        maybeCommit();
         LOG.info(
                 "node {} proposing to {} node {} at index {}",
                 cfg.nodeId(),

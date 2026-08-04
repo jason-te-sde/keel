@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Default logging for a running node.
+
+  Without a configuration file Log4j2 falls back to console output at ERROR, which means a node that
+  is failing to elect a leader looks exactly like a node that is idle. That is not a debugging
+  inconvenience, it is the difference between an operable service and an opaque one.
+
+  Level is overridable without rebuilding: -Dkeel.log.level=DEBUG.
+-->
+<Configuration status="WARN">
+  <Properties>
+    <Property name="level">${sys:keel.log.level:-INFO}</Property>
+    <!-- Thread name is in the pattern on purpose. The threading model is the design, so knowing
+         whether a line came from the raft thread or the apply thread is most of the context. -->
+    <Property name="pattern">%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%t] %logger{1} - %msg%n</Property>
+  </Properties>
+
+  <Appenders>
+    <Console name="stdout" target="SYSTEM_OUT">
+      <PatternLayout pattern="${pattern}"/>
+    </Console>
+  </Appenders>
+
+  <Loggers>
+    <Logger name="io.keel" level="${level}"/>
+    <!-- gRPC and Netty are chatty at INFO and say nothing useful about consensus. -->
+    <Logger name="io.grpc" level="WARN"/>
+    <Root level="WARN">
+      <AppenderRef ref="stdout"/>
+    </Root>
+  </Loggers>
+</Configuration>
