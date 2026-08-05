@@ -17,11 +17,6 @@
     generated at build time and never committed.
   </description>
 
-  <properties>
-    <!-- Generated sources; javadoc on them is noise, not documentation. -->
-    <maven.javadoc.skip>true</maven.javadoc.skip>
-  </properties>
-
   <dependencies>
     <dependency>
       <groupId>com.google.protobuf</groupId>

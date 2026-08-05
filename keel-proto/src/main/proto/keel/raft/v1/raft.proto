@@ -134,6 +134,8 @@ message InstallSnapshotAck {
   uint64 match_index = 4;
 }
 
+// The peer-to-peer transport: one method to deliver a consensus message, one to
+// move a snapshot payload that the consensus core itself never sees.
 service RaftService {
   // Delivers one message. The acknowledgement means "received", never "agreed":
   // consensus decisions travel as further messages.

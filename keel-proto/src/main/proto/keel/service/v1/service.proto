@@ -26,6 +26,12 @@ enum ErrorCode {
   ERROR_CODE_INVALID = 6;
 }
 
+// Carried by every response.
+//
+// Failures arrive here rather than as gRPC status codes because most of them are
+// an ordinary part of talking to a replicated service and carry something the
+// caller can act on. "You asked a follower, the leader is node 3" is a routing
+// instruction, not an error.
 message ResponseHeader {
   ErrorCode code = 1;
   uint64 leader_hint = 2;
@@ -122,6 +128,9 @@ message MemberChangeResponse {
   repeated uint64 voters = 2;
 }
 
+// The client-facing API. Every method must reach the leader, except a Get that
+// the caller has said need not be linearizable, which any replica can answer from
+// whatever it currently holds.
 service KvService {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);

@@ -21,6 +21,13 @@ enum EntryType {
   ENTRY_TYPE_CONF_CHANGE = 3;
 }
 
+// One entry in the replicated log.
+//
+// An index and a term together identify an entry: if two logs hold the same term
+// at the same index, they hold the same entry and the same prefix below it. Every
+// repair path in the protocol rests on that (Raft 5.3). The index is assigned by
+// the leader that created the entry and never changes, so an entry that loses an
+// election is overwritten rather than renumbered.
 message Entry {
   uint64 index = 1;
   uint64 term = 2;
@@ -38,10 +45,23 @@ message HardState {
   uint64 commit = 3;
 }
 
+// The set of voters as of some point in the log.
+//
+// Stored in snapshot metadata rather than derived by replaying configuration
+// entries, because a node restoring from a snapshot no longer has the prefix it
+// would need to replay.
 message ConfState {
   repeated uint64 voters = 1;
 }
 
+// What a snapshot stands in for: every log entry at or below last_index.
+//
+// last_index and last_term must describe the same entry. A receiver compares the
+// term it holds at last_index against last_term to decide whether it can keep its
+// own entries above the boundary, so metadata that misdescribes its own boundary
+// fails that comparison and makes the receiver discard entries it has already
+// acknowledged, which can leave a committed entry on fewer than a majority. Build
+// the pair from one entry, never from two sources that usually agree.
 message SnapshotMetadata {
   uint64 last_index = 1;
   uint64 last_term = 2;
@@ -73,6 +93,13 @@ message Record {
   }
 }
 
+// A single membership change. It takes effect when the entry carrying it is
+// applied, not when it is appended.
+//
+// One voter at a time, which is what makes this safe without the joint consensus
+// of Raft 6: any old majority and any new majority still overlap, so two disjoint
+// quorums cannot both elect (4.3). A second change is refused while the first is
+// unapplied.
 message ConfChange {
   enum Type {
     TYPE_UNSPECIFIED = 0;

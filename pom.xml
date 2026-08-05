@@ -269,8 +269,11 @@
                    the check something to disable rather than something to satisfy. -->
               <doclint>all,-missing</doclint>
               <quiet>true</quiet>
-              <!-- keel-proto skips javadoc, so cross-linking to it would look for output that
-                   was never generated and log an error per module. -->
+              <!-- The published documentation is one aggregate over every module, so a type in
+                   another module is already on the same site and needs no link across builds.
+                   Left off because the links this generates are derived from <url> and point at
+                   paths under the GitHub repository that do not exist, which is worse than no
+                   link: it turns a plain type name into a 404. -->
               <detectOfflineLinks>false</detectOfflineLinks>
             </configuration>
             <executions>
