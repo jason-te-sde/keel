@@ -59,8 +59,8 @@
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
 
     <!-- protobuf-java and grpc-java releases are coupled; bump them together. -->
-    <protobuf.version>4.29.3</protobuf.version>
-    <grpc.version>1.70.0</grpc.version>
+    <protobuf.version>4.35.1</protobuf.version>
+    <grpc.version>1.83.1</grpc.version>
 
     <!-- Coupled: log4j-slf4j2-impl pins the slf4j-api it was built against, and a mismatch fails
          requireUpperBoundDeps rather than failing at runtime. Bump them together. -->
