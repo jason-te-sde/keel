@@ -7,7 +7,7 @@
   <parent>
     <groupId>io.github.jason-te-sde</groupId>
     <artifactId>keel-parent</artifactId>
-    <version>0.3.0</version>
+    <version>0.3.1</version>
   </parent>
 
   <artifactId>keel-raft</artifactId>

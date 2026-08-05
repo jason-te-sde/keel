@@ -86,7 +86,7 @@ be driven by something other than this server. That is the module most people wo
 <dependency>
   <groupId>io.github.jason-te-sde</groupId>
   <artifactId>keel-raft</artifactId>
-  <version>0.3.0</version>
+  <version>0.3.1</version>
 </dependency>
 ```
 
@@ -228,14 +228,14 @@ Measured on an Apple M-series laptop, APFS, JDK 21. Every figure has the command
 
 | | |
 | --- | --- |
-| Tests | **246** (plus one benchmark, off by default) |
-| Line / branch coverage | **83.9% / 78.4%** |
-| Simulation throughput | **146,038 ticks/s** |
-| Soak run | 200 seeds, **240,000 invariant checks**, 10,462 snapshots, **1.6s**, zero violations |
+| Tests | **253** (plus one benchmark, off by default) |
+| Line / branch coverage | **84.9% / 78.5%** |
+| Simulation throughput | **149,149 ticks/s** |
+| Soak run | 10,000 seeds, **12,000,000 invariant checks**, 572,141 snapshots, **81s**, zero violations |
 | Log append, no fsync | 108,081 entries/s (26.4 MiB/s) |
 | Log append, fsync per batch of 64 | 19,708 entries/s (4.8 MiB/s) |
 | Log append, fsync per entry | **328 entries/s** |
-| Hand-written Java | 9,791 lines main, 5,775 lines test |
+| Hand-written Java | 9,899 lines main, 6,048 lines test |
 | Runtime dependencies | Protobuf, gRPC, RocksDB, SLF4J |
 
 ```bash
@@ -306,6 +306,36 @@ idle is the failure mode this project is most exposed to.
 
 <table>
 <tr><th>Bug</th><th>What caught it</th></tr>
+<tr>
+<td><b>A snapshot install discarded entries the receiver had acknowledged.</b> When the entry at the
+snapshot's boundary already matches, the prefix below it matches too and there is nothing to install;
+discarding threw away entries <i>above</i> the boundary that a leader had already counted toward a
+quorum, leaving a committed entry on a minority and letting a node without it win the next
+election.</td>
+<td>The nightly soak, once the sweep was widened from 500 seeds to 10,000. Seed 1695.</td>
+</tr>
+<tr>
+<td><b>A heartbeat committed an entry the node had never matched.</b> The commit index was clamped to
+the receiver's own last index, but a heartbeat carries no evidence of what the log below it holds, so
+after a leader change the node applied a command the cluster never agreed on.</td>
+<td>The same sweep. Seed 1537.</td>
+</tr>
+<tr>
+<td><b>Snapshot metadata misdescribed its own boundary.</b> The boundary index came from the state
+machine, which only sees client commands, and the term from the last entry applied of any kind. Across
+a term change those describe different entries, so the snapshot advertised a term its boundary did not
+have and every receiver failed the match check, reaching the first bug's failure mode by feeding the
+fix bad input.</td>
+<td>The same sweep, two fixes later. Seed 2626, traced through the leader's own view of the quorum at
+the moment it committed: <code>matches[1=41 2=0 3=41 4=40 5=42]</code>, where node 3 held nothing at
+index 41.</td>
+</tr>
+<tr>
+<td><b>A leader counted its own undurable entries toward a quorum,</b> so an entry could be reported
+committed before it would survive the leader's own crash.</td>
+<td>Found while chasing the one above; caught by unit tests when the fix broke single-node clusters,
+which have no reply to trigger a commit check.</td>
+</tr>
 <tr>
 <td><b>Inverted pre-vote term check.</b> A <i>granted</i> pre-vote made the candidate step down, so
 multi-node clusters could never elect anyone.</td>
