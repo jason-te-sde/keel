@@ -67,7 +67,7 @@
     <slf4j.version>2.0.17</slf4j.version>
     <log4j.version>2.26.1</log4j.version>
     <rocksdb.version>9.7.3</rocksdb.version>
-    <junit.version>5.11.4</junit.version>
+    <junit.version>6.1.2</junit.version>
 
     <compiler.plugin.version>3.13.0</compiler.plugin.version>
     <surefire.plugin.version>3.5.2</surefire.plugin.version>
