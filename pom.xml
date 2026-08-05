@@ -64,7 +64,7 @@
 
     <!-- Coupled: log4j-slf4j2-impl pins the slf4j-api it was built against, and a mismatch fails
          requireUpperBoundDeps rather than failing at runtime. Bump them together. -->
-    <slf4j.version>2.0.17</slf4j.version>
+    <slf4j.version>2.0.18</slf4j.version>
     <log4j.version>2.26.1</log4j.version>
     <rocksdb.version>9.7.3</rocksdb.version>
     <junit.version>5.11.4</junit.version>
