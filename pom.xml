@@ -59,25 +59,25 @@
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
 
     <!-- protobuf-java and grpc-java releases are coupled; bump them together. -->
-    <protobuf.version>4.29.3</protobuf.version>
-    <grpc.version>1.70.0</grpc.version>
+    <protobuf.version>4.35.1</protobuf.version>
+    <grpc.version>1.83.1</grpc.version>
 
     <!-- Coupled: log4j-slf4j2-impl pins the slf4j-api it was built against, and a mismatch fails
          requireUpperBoundDeps rather than failing at runtime. Bump them together. -->
-    <slf4j.version>2.0.17</slf4j.version>
+    <slf4j.version>2.0.18</slf4j.version>
     <log4j.version>2.26.1</log4j.version>
-    <rocksdb.version>9.7.3</rocksdb.version>
-    <junit.version>5.11.4</junit.version>
+    <rocksdb.version>10.10.1.1</rocksdb.version>
+    <junit.version>6.1.2</junit.version>
 
-    <compiler.plugin.version>3.13.0</compiler.plugin.version>
-    <surefire.plugin.version>3.5.2</surefire.plugin.version>
-    <jacoco.plugin.version>0.8.12</jacoco.plugin.version>
-    <enforcer.plugin.version>3.5.0</enforcer.plugin.version>
-    <shade.plugin.version>3.6.0</shade.plugin.version>
+    <compiler.plugin.version>3.15.0</compiler.plugin.version>
+    <surefire.plugin.version>3.5.6</surefire.plugin.version>
+    <jacoco.plugin.version>0.8.15</jacoco.plugin.version>
+    <enforcer.plugin.version>3.6.3</enforcer.plugin.version>
+    <shade.plugin.version>3.6.2</shade.plugin.version>
     <protobuf.plugin.version>3.1.0</protobuf.plugin.version>
-    <source.plugin.version>3.3.1</source.plugin.version>
-    <javadoc.plugin.version>3.11.2</javadoc.plugin.version>
-    <gpg.plugin.version>3.2.7</gpg.plugin.version>
+    <source.plugin.version>3.4.0</source.plugin.version>
+    <javadoc.plugin.version>3.12.0</javadoc.plugin.version>
+    <gpg.plugin.version>3.2.8</gpg.plugin.version>
     <central.plugin.version>0.7.0</central.plugin.version>
   </properties>
 
