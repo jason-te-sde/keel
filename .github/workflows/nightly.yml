@@ -36,3 +36,14 @@ jobs:
           -Dtest=SoakTest
           -Dsurefire.failIfNoSpecifiedTests=false
           -Denforcer.skip=true
+
+      # A soak failure names the seed that reproduces it and dumps the cluster state at the point of
+      # the violation. That output is the entire value of the run, so it is kept rather than left in
+      # a log that ages out.
+      - name: soak report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-reports
+          path: 'keel-testkit/target/surefire-reports/**'
+          retention-days: 30
