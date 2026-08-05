@@ -46,6 +46,12 @@ message CasCommand {
 
 message RegisterClientCommand {}
 
+// One state machine command, as written into the Raft log.
+//
+// The session sits beside the command kind rather than inside it because it
+// applies to all of them. It may be left empty, which asks for the command to be
+// applied once with no retry protection; register_client is always sessionless,
+// since it is what hands out the client id a session needs.
 message Command {
   Session session = 1;
   oneof kind {
@@ -56,6 +62,11 @@ message Command {
   }
 }
 
+// What applying a Command produced.
+//
+// Kept per session in the deduplication table and in the snapshot, so a retry of
+// an already-applied request returns the original answer instead of being applied
+// a second time.
 message CommandResult {
   // False when a precondition failed. A rejected compare-and-swap is a normal
   // outcome, not an error: it is deterministic and every replica reaches it.
