@@ -4,6 +4,52 @@ Notable changes, newest first. Versions follow [semantic versioning](https://sem
 and until 1.0 the wire format and the on-disk format may both change between minor
 versions.
 
+## v0.3.1
+
+A patch release, and the only one so far that anyone running v0.1.0 through v0.3.0 needs to take
+seriously: every tag before it can lose a committed entry.
+
+### Fixed (#53)
+
+Widening the nightly soak from 500 seeds to 10,000 turned up four separate ways a committed entry
+could end up on fewer than a majority of nodes. Three were in the consensus core and one was in the
+simulator that drives it, which is why the fourth went unnoticed while the first three were being
+fixed.
+
+- **`InstallSnapshot` discarded the receiver's whole log.** When the entry at the snapshot's boundary
+  already matches, Log Matching says the prefix below it matches too and there is nothing to install.
+  Discarding threw away entries above the boundary that the node had acknowledged and a leader had
+  counted toward a quorum. Paper figure 13, step 6
+- **A heartbeat's commit index was clamped to the receiver's last index.** A heartbeat carries no
+  proof of what the log below it holds, so this committed whichever entry happened to sit there,
+  which after a leader change is not the entry the leader meant
+- **A leader counted its own undurable entries toward a quorum.** It now counts only as far as the
+  driver has confirmed persisted, which makes the durable boundary moving a reason to recheck what is
+  committed
+- **Snapshot metadata took its boundary index and its term from different entries,** so across a term
+  change it advertised a term its own boundary did not have. Receivers failed the match check and
+  discarded acknowledged entries. Both log stores now reject metadata that misdescribes its own
+  boundary, so this fails where it is built rather than several hundred ticks later
+
+The three seeds reachable from the simulator are pinned in `RegressionSeedTest`, and each fix has a
+unit test that isolates it. 10,000 seeds now pass: 12,000,000 invariant checks, 572,141 snapshots.
+
+### Build and CI
+
+- The nightly soak reports the seed and the cluster state for **any** exception, not just invariant
+  violations. Two of the four seeds above were unreplayable before this
+- Dependency groups for coupled artifacts, after a log4j bump spent a week red because it needed an
+  slf4j bump the enforcer correctly refused without (#55)
+- `MetricsEndpointTest.followerMetrics` no longer assumes a cluster holds still between a leader
+  lookup and a scrape. It was the only failing check on four unrelated dependency pull requests
+- The protobuf plugin no longer races with itself over a temporary directory, which broke local
+  builds on macOS about every other run while CI stayed green (#57)
+- `scripts/preflight.sh` runs the full verify on every JDK in the CI matrix, since `-Werror` plus
+  lint categories that differ between releases had twice turned a job red only on JDK 25
+- Every dependency current, including three major bumps (JUnit 6, RocksDB 10, protobuf 4.35)
+- `keel-proto` attaches a javadoc jar. Maven Central requires one, and because the published site is
+  an aggregate that honoured the same skip, every proto type had been missing from it (#64)
+
 ## v0.3.0
 
 The release that makes this usable by someone other than its author. v0.2.0 was a correct store
