@@ -297,6 +297,15 @@
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-gpg-plugin</artifactId>
             <version>${gpg.plugin.version}</version>
+            <configuration>
+              <!-- Take the passphrase from the environment instead of prompting. Without this a
+                   signing run on a machine with no terminal does not fail, it hangs waiting for a
+                   pinentry dialog that nobody will ever see. -->
+              <gpgArguments>
+                <arg>--pinentry-mode</arg>
+                <arg>loopback</arg>
+              </gpgArguments>
+            </configuration>
             <executions>
               <execution>
                 <id>sign-artifacts</id>

@@ -1,0 +1,77 @@
+name: Publish to Maven Central
+
+# Deliberately manual. A published version is permanent and cannot be replaced, so this does not
+# run itself off a tag push: it is started by a person who has decided to publish that version.
+#
+# What it produces is a *staged* deployment. The last step, promoting it, is a button in the
+# Central portal, because reading the file list once before it becomes permanent is cheap and
+# undoing a mistake afterwards is impossible.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, e.g. 0.3.1. Must match the version in the POMs.'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The environment is where the credentials live, so publishing can require a review without
+    # anyone editing this file.
+    environment: maven-central
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: check the version is the one being published
+        run: |
+          pom=$(grep -m1 '<version>' pom.xml | sed 's/.*<version>\(.*\)<\/version>.*/\1/')
+          echo "POM says '$pom', input says '${{ inputs.version }}'"
+          if [ "$pom" != "${{ inputs.version }}" ]; then
+            echo "::error::the POM version and the requested version disagree" >&2
+            exit 1
+          fi
+          case "$pom" in
+            *SNAPSHOT*)
+              echo "::error::refusing to publish a snapshot" >&2
+              exit 1
+              ;;
+          esac
+
+      # server-id matches <publishingServerId> in the publish profile, and gpg-passphrase names the
+      # environment variable maven-gpg-plugin reads rather than carrying the value itself.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          server-id: central
+          server-username: MAVEN_USERNAME
+          server-password: MAVEN_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      # The tests have run on this commit already. They run again because the thing being published
+      # is built here, and an artifact that was never tested in the form it ships in is a guess.
+      - name: verify
+        run: mvn -B -ntp verify
+
+      - name: sign and upload to the staging portal
+        run: mvn -B -ntp -Prelease,publish deploy -DskipTests
+        env:
+          MAVEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: what to do next
+        run: |
+          echo "### Staged, not published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ inputs.version }}\` is uploaded and waiting in the Central portal." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "1. Open <https://central.sonatype.com/publishing/deployments>" >> "$GITHUB_STEP_SUMMARY"
+          echo "2. Check the six modules are there, each with a jar, sources, javadoc and signature" >> "$GITHUB_STEP_SUMMARY"
+          echo "3. Press **Publish**. It is permanent from that point on." >> "$GITHUB_STEP_SUMMARY"

@@ -98,9 +98,11 @@ be driven by something other than this server. That is the module most people wo
 | `keel-testkit` | the simulator and linearizability checker, usable against your own state machine |
 | `keel-node` | the whole server, if you want it rather than the pieces |
 
-**Not on Maven Central yet.** Publishing needs a Sonatype account and a signing key that cannot
-live in the repository; [`RELEASING.md`](RELEASING.md) has the sequence. Until then, `mvn install`
-puts the modules in your local repository, and each release has the runnable jar attached.
+**Not on Maven Central yet.** The build signs and uploads from CI, but the account and signing key
+behind it cannot live in the repository; [`SETUP-PUBLISHING.md`](SETUP-PUBLISHING.md) is what a
+maintainer follows to supply them and [`RELEASING.md`](RELEASING.md) is the release sequence itself.
+Until then, `mvn install` puts the modules in your local repository, and each release has the
+runnable jar attached.
 
 API documentation: **[jason-te-sde.github.io/keel](https://jason-te-sde.github.io/keel/)**
 
