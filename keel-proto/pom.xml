@@ -46,34 +46,33 @@
   </dependencies>
 
   <build>
-    <extensions>
-      <!-- Supplies ${os.detected.classifier} so the right protoc binary is
-           fetched for the build host. -->
-      <extension>
-        <groupId>kr.motd.maven</groupId>
-        <artifactId>os-maven-plugin</artifactId>
-        <version>${os.plugin.version}</version>
-      </extension>
-    </extensions>
-
     <plugins>
+      <!-- One goal generates both the messages and the gRPC stubs. The previous plugin used two
+           goals that shared a temporary directory for the .proto files unpacked out of dependency
+           jars, and they raced over it: the first goal's cleanup deleted the directory the second
+           was about to read, or failed to delete it at all and stopped the build. Neither happened
+           on the Linux runners, so it only ever broke local builds. -->
       <plugin>
-        <groupId>org.xolstice.maven.plugins</groupId>
+        <groupId>io.github.ascopes</groupId>
         <artifactId>protobuf-maven-plugin</artifactId>
+        <version>${protobuf.plugin.version}</version>
         <configuration>
-          <protocArtifact>
-            com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}
-          </protocArtifact>
-          <pluginId>grpc-java</pluginId>
-          <pluginArtifact>
-            io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}
-          </pluginArtifact>
+          <protocVersion>${protobuf.version}</protocVersion>
+          <sourceDirectories>
+            <sourceDirectory>src/main/proto</sourceDirectory>
+          </sourceDirectories>
+          <binaryMavenPlugins>
+            <binaryMavenPlugin>
+              <groupId>io.grpc</groupId>
+              <artifactId>protoc-gen-grpc-java</artifactId>
+              <version>${grpc.version}</version>
+            </binaryMavenPlugin>
+          </binaryMavenPlugins>
         </configuration>
         <executions>
           <execution>
             <goals>
-              <goal>compile</goal>
-              <goal>compile-custom</goal>
+              <goal>generate</goal>
             </goals>
           </execution>
         </executions>

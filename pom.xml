@@ -74,12 +74,11 @@
     <jacoco.plugin.version>0.8.12</jacoco.plugin.version>
     <enforcer.plugin.version>3.5.0</enforcer.plugin.version>
     <shade.plugin.version>3.6.0</shade.plugin.version>
-    <protobuf.plugin.version>0.6.1</protobuf.plugin.version>
+    <protobuf.plugin.version>3.1.0</protobuf.plugin.version>
     <source.plugin.version>3.3.1</source.plugin.version>
     <javadoc.plugin.version>3.11.2</javadoc.plugin.version>
     <gpg.plugin.version>3.2.7</gpg.plugin.version>
     <central.plugin.version>0.7.0</central.plugin.version>
-    <os.plugin.version>1.7.1</os.plugin.version>
   </properties>
 
   <dependencyManagement>
@@ -205,11 +204,6 @@
           <version>${shade.plugin.version}</version>
         </plugin>
 
-        <plugin>
-          <groupId>org.xolstice.maven.plugins</groupId>
-          <artifactId>protobuf-maven-plugin</artifactId>
-          <version>${protobuf.plugin.version}</version>
-        </plugin>
       </plugins>
     </pluginManagement>
 
