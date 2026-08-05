@@ -7,6 +7,34 @@
 - `mvn verify` must pass before a pull request is opened. It compiles with
   `-Werror`, so a warning is a build failure.
 
+## Before you push
+
+```sh
+scripts/preflight.sh
+```
+
+This runs `mvn verify` on **every JDK in the CI matrix**, currently 21 and 25.
+
+Running it on one JDK is not enough to predict CI. Lint categories change between
+releases, and because the build treats warnings as errors, a comment or a
+construct that is silent on 21 can fail on 25. That has happened twice, and both
+times the fix was one line found ten minutes after a push that should not have
+happened.
+
+The script fails if it cannot find a JDK in the matrix rather than skipping it,
+because a preflight that checks half the matrix gives you the confidence without
+the coverage. It looks in the usual places and honours `JAVA21_HOME` and
+`JAVA25_HOME`. To install one without root:
+
+```sh
+mkdir -p ~/Library/Java/JavaVirtualMachines
+curl -sSL 'https://api.adoptium.net/v3/binary/latest/25/ga/mac/aarch64/jdk/hotspot/normal/eclipse' \
+  | tar xz -C ~/Library/Java/JavaVirtualMachines
+```
+
+Adjust `mac/aarch64` for your platform. Arguments are passed through to Maven, so
+`scripts/preflight.sh -DskipTests` compiles on both without running the suite.
+
 ## Workflow
 
 1. Open an issue first. It states the problem, the proposed approach, and
