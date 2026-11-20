@@ -96,7 +96,9 @@ mvn test -pl keel-testkit -Dkeel.sim.seeds=2000 -Dtest=SoakTest \
     -Dsurefire.failIfNoSpecifiedTests=false
 ```
 
-The nightly workflow runs 2,000 seeds. Locally, 200 seeds is 240,000 invariant checks in
+The scheduled nightly workflow runs 2,000 seeds (`nightly.yml`; a manual dispatch can set another
+count). A single dispatched run on 4 August 2026 swept 10,000 seeds, after the four fixes in the
+v0.3.1 changelog, and passed; that wider sweep is not part of the nightly. Locally, 200 seeds is 240,000 invariant checks in
 about three seconds.
 
 ## What this suite does not cover

@@ -233,7 +233,7 @@ Measured on an Apple M-series laptop, APFS, JDK 21. Every figure has the command
 | Tests | **253** (plus one benchmark, off by default) |
 | Line / branch coverage | **84.9% / 78.5%** |
 | Simulation throughput | **149,149 ticks/s** |
-| Soak run | 10,000 seeds, **12,000,000 invariant checks**, 572,141 snapshots, **81s**, zero violations |
+| Soak run (once, 4 Aug 2026; the nightly runs 2,000 seeds) | 10,000 seeds, **12,000,000 invariant checks**, 572,141 snapshots, **81s**, zero violations |
 | Log append, no fsync | 108,081 entries/s (26.4 MiB/s) |
 | Log append, fsync per batch of 64 | 19,708 entries/s (4.8 MiB/s) |
 | Log append, fsync per entry | **328 entries/s** |
@@ -314,7 +314,7 @@ snapshot's boundary already matches, the prefix below it matches too and there i
 discarding threw away entries <i>above</i> the boundary that a leader had already counted toward a
 quorum, leaving a committed entry on a minority and letting a node without it win the next
 election.</td>
-<td>The nightly soak, once the sweep was widened from 500 seeds to 10,000. Seed 1695.</td>
+<td>The nightly soak, which runs 2,000 seeds. Seed 1695.</td>
 </tr>
 <tr>
 <td><b>A heartbeat committed an entry the node had never matched.</b> The commit index was clamped to
