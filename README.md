@@ -233,7 +233,7 @@ Measured on an Apple M-series laptop, APFS, JDK 21. Every figure has the command
 | Tests | **253** (plus one benchmark, off by default) |
 | Line / branch coverage | **84.9% / 78.5%** |
 | Simulation throughput | **149,149 ticks/s** |
-| Soak run (once, 4 Aug 2026; the nightly runs 2,000 seeds) | 10,000 seeds, **12,000,000 invariant checks**, 572,141 snapshots, **81s**, zero violations |
+| Soak run, after the v0.3.1 fixes (the nightly runs 2,000 seeds) | 10,000 seeds, **12,000,000 invariant checks**, 572,141 snapshots, **81s**, zero violations |
 | Log append, no fsync | 108,081 entries/s (26.4 MiB/s) |
 | Log append, fsync per batch of 64 | 19,708 entries/s (4.8 MiB/s) |
 | Log append, fsync per entry | **328 entries/s** |
@@ -320,7 +320,7 @@ election.</td>
 <td><b>A heartbeat committed an entry the node had never matched.</b> The commit index was clamped to
 the receiver's own last index, but a heartbeat carries no evidence of what the log below it holds, so
 after a leader change the node applied a command the cluster never agreed on.</td>
-<td>The same sweep. Seed 1537.</td>
+<td>A local sweep widened from 500 seeds to 10,000 while fixing 1695. Seed 1537.</td>
 </tr>
 <tr>
 <td><b>Snapshot metadata misdescribed its own boundary.</b> The boundary index came from the state
@@ -328,7 +328,7 @@ machine, which only sees client commands, and the term from the last entry appli
 a term change those describe different entries, so the snapshot advertised a term its boundary did not
 have and every receiver failed the match check, reaching the first bug's failure mode by feeding the
 fix bad input.</td>
-<td>The same sweep, two fixes later. Seed 2626, traced through the leader's own view of the quorum at
+<td>That local sweep, two fixes later. Seed 2626, traced through the leader's own view of the quorum at
 the moment it committed: <code>matches[1=41 2=0 3=41 4=40 5=42]</code>, where node 3 held nothing at
 index 41.</td>
 </tr>

@@ -11,8 +11,8 @@ seriously: every tag before it can lose a committed entry.
 
 ### Fixed (#53)
 
-The nightly soak (2,000 seeds) started failing on seed 1695, and a one-off 10,000-seed run while
-fixing it turned up four separate ways a committed entry
+The nightly soak (2,000 seeds) started failing on seed 1695. Widening a local sweep from 500 seeds
+to 10,000 while fixing it (the message of commit 57ce872) turned up four separate ways a committed entry
 could end up on fewer than a majority of nodes. Three were in the consensus core and one was in the
 simulator that drives it, which is why the fourth went unnoticed while the first three were being
 fixed.
@@ -33,8 +33,8 @@ fixed.
   boundary, so this fails where it is built rather than several hundred ticks later
 
 The three seeds reachable from the simulator are pinned in `RegressionSeedTest`, and each fix has a
-unit test that isolates it. 10,000 seeds then passed in one manually dispatched run of the soak workflow on 4 August 2026:
-12,000,000 invariant checks, 572,141 snapshots.
+unit test that isolates it. 10,000 seeds then passed, on the laptop and in one manually dispatched
+run of the soak workflow on 4 August 2026: 12,000,000 invariant checks, 572,141 snapshots.
 
 ### Build and CI
 
