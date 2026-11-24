@@ -43,7 +43,7 @@ jobs:
 
       # server-id matches <publishingServerId> in the publish profile, and gpg-passphrase names the
       # environment variable maven-gpg-plugin reads rather than carrying the value itself.
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
